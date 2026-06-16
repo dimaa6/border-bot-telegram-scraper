@@ -1,0 +1,6 @@
+.vscode/
+db/*.db
+config/
+.venv/
+logs/
+*.session
