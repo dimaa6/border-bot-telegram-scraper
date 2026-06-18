@@ -1,5 +1,6 @@
 .vscode/
 db/*.db
+**/__pycache__/
 config/
 .venv/
 logs/

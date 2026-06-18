@@ -1,40 +1,23 @@
 import os
 import asyncio
 import sqlite3
-import gzip
-import shutil
 import logging
-from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime, timezone, timedelta
 from telethon import TelegramClient
-from supabase import create_client, Client
 import tomllib  # Built-in for Python 3.11+
+from supabase_client import get_supabase_client, get_active_checkpoints, update_supabase_state
+from llm_extractor import process_all_checkpoints
 
 # --- LOGGING SETUP ---
 os.makedirs("logs", exist_ok=True)
 
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 
-# File Handler (Daily rotation at midnight, archives all logs indefinitely)
-file_handler = TimedRotatingFileHandler(
+# File Handler
+file_handler = logging.FileHandler(
     os.path.join("logs", "scraper.log"),
-    when="midnight",
-    interval=1,
-    backupCount=0,
     encoding="utf-8"
 )
-
-def gzip_namer(default_name):
-    return default_name + ".gz"
-
-def gzip_rotator(source, dest):
-    with open(source, 'rb') as f_in:
-        with gzip.open(dest, 'wb') as f_out:
-            shutil.copyfileobj(f_in, f_out)
-    os.remove(source)
-
-file_handler.namer = gzip_namer
-file_handler.rotator = gzip_rotator
 file_handler.setFormatter(log_formatter)
 
 console_handler = logging.StreamHandler()
@@ -54,8 +37,10 @@ try:
 
     TELEGRAM_API_ID = int(config_data["telegram_app"]["id"])
     TELEGRAM_API_HASH = str(config_data["telegram_app"]["hash"])
-    SUPABASE_URL = str(config_data["supabase"]["url"])
-    SUPABASE_KEY = str(config_data["supabase"]["key"])
+
+    # Load ignored users. Automatically convert to lowercase and strip out any accidental '@' symbols.
+    IGNORE_USERS = [str(u).lower().lstrip('@') for u in config_data.get("ignore", {}).get("users", [])]
+
 except FileNotFoundError:
     raise FileNotFoundError(f"Critical error: Configuration file not found at '{CONFIG_PATH}'. Please verify the path.")
 except KeyError as e:
@@ -64,16 +49,48 @@ except ValueError:
     raise ValueError(f"Critical error: 'id' in '{CONFIG_PATH}' must be a valid integer.")
 
 # Initialize Supabase Admin Client
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase = get_supabase_client()
+
+def is_valid_message(message, ignore_users):
+    """Check if the message has text and is not from an ignored user."""
+    if not message.text:
+        return False
+    
+    sender = message.sender
+    if ignore_users and sender and getattr(sender, 'username', None):
+        if sender.username.lower() in ignore_users:
+            return False
+            
+    return True
+
+def extract_message_fields(message):
+    """Extract standard fields and reply_to_msg_id from a Telegram message."""
+    msg_id = message.id
+    sender_id = message.sender_id
+    msg_date = message.date.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+    text = message.text
+
+    reply_to_id = None
+    if message.reply_to and hasattr(message.reply_to, 'reply_to_msg_id'):
+        reply_to_id = message.reply_to.reply_to_msg_id
+        
+    return msg_id, sender_id, msg_date, text, reply_to_id
+
+def insert_message(db_cursor, cp_id, msg_id, reply_to_id, sender_id, text, msg_date):
+    """Insert a message into the local database and return 1 if successful, 0 if duplicate."""
+    try:
+        db_cursor.execute('''
+            INSERT INTO message_log (checkpoint_id, message_id, reply_to_msg_id, sender_id, message_text, recorded_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        ''', (cp_id, msg_id, reply_to_id, sender_id, text, msg_date))
+        return 1
+    except sqlite3.IntegrityError:
+        return 0
 
 async def scrape_active_channels():
     # 1. Fetch active targets from Supabase config
-    response = supabase.table("checkpoint_scraper_config") \
-        .select("checkpoint_id, telegram_handle, last_message_id, lookback_hours") \
-        .eq("active", True) \
-        .execute()
-
-    checkpoints = response.data
+    checkpoints = get_active_checkpoints(supabase)
+    
     if not checkpoints:
         logger.info("No active checkpoints to scrape.")
         return
@@ -109,13 +126,14 @@ async def scrape_active_channels():
         messages_inserted = 0
 
         try:
+            lookback = cp.get('lookback_hours')
+            if lookback is None:
+                lookback = 3  # Fallback to 3 hours if null or not set
+            
+            cutoff_time = datetime.now(timezone.utc) - timedelta(hours=lookback)
+
             # Handle cold-boot baseline safety
             if min_id is None or min_id == 0:
-                lookback = cp.get('lookback_hours')
-                if lookback is None:
-                    lookback = 3  # Fallback to 3 hours if null or not set
-                
-                cutoff_time = datetime.now(timezone.utc) - timedelta(hours=lookback)
                 logger.info(f"Cold boot detected for {cp_id}. Fetching messages up to {lookback} hours back...")
                 
                 first_msg = True
@@ -128,59 +146,36 @@ async def scrape_active_channels():
                     if message.date.astimezone(timezone.utc) < cutoff_time:
                         break
                         
-                    if not message.text:
+                    if not is_valid_message(message, IGNORE_USERS):
                         continue
 
-                    msg_id = message.id
-                    sender_id = message.sender_id
-                    msg_date = message.date.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-                    text = message.text
+                    msg_id, sender_id, msg_date, text, reply_to_id = extract_message_fields(message)
 
-                    try:
-                        db_cursor.execute('''
-                            INSERT INTO message_log (channel_username, message_id, sender_id, message_text, recorded_at)
-                            VALUES (?, ?, ?, ?, ?)
-                        ''', (handle, msg_id, sender_id, text, msg_date))
-                        messages_inserted += 1
-                    except sqlite3.IntegrityError:
-                        pass
+                    messages_inserted += insert_message(db_cursor, cp_id, msg_id, reply_to_id, sender_id, text, msg_date)
 
                 db_conn.commit()
                 logger.info(f"-> Local SQLite synced: Added {messages_inserted} historical updates for {cp_id}.")
 
                 # Update Supabase instantly so the next cron run has a valid anchor
-                supabase.table("checkpoint_scraper_config") \
-                    .update({
-                        "last_message_id": new_high_water_mark,
-                        "last_scraped_at": datetime.now(timezone.utc).isoformat()
-                    }) \
-                    .eq("checkpoint_id", cp_id) \
-                    .execute()
-                logger.info(f"-> Cold boot complete: Baseline high_water mark pinned to {new_high_water_mark}.")
+                update_supabase_state(supabase, cp_id, new_high_water_mark)
+                logger.info(f"-> Cold boot complete: Baseline high_water mark pinned to {new_high_water_mark}. Inserted {messages_inserted} messages.")
                 continue  # Skip to the next checkpoint in the loop
 
             # Regular forward scraping path (runs normally when min_id > 0)
-            async for message in client.iter_messages(handle, min_id=min_id, reverse=True):
-                if not message.text:
+            async for message in client.iter_messages(handle, min_id=min_id, limit=30):
+                # Keep moving the marker forward unconditionally for every message seen
+                if message.id > new_high_water_mark:
+                    new_high_water_mark = message.id
+
+                if message.date.astimezone(timezone.utc) < cutoff_time:
+                    break
+
+                if not is_valid_message(message, IGNORE_USERS):
                     continue
 
-                msg_id = message.id
-                sender_id = message.sender_id
-                msg_date = message.date.astimezone(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-                text = message.text
+                msg_id, sender_id, msg_date, text, reply_to_id = extract_message_fields(message)
 
-                try:
-                    db_cursor.execute('''
-                        INSERT INTO message_log (channel_username, message_id, sender_id, message_text, recorded_at)
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', (handle, msg_id, sender_id, text, msg_date))
-                    messages_inserted += 1
-                except sqlite3.IntegrityError:
-                    pass
-
-                # Keep moving the marker forward
-                if msg_id > new_high_water_mark:
-                    new_high_water_mark = msg_id
+                messages_inserted += insert_message(db_cursor, cp_id, msg_id, reply_to_id, sender_id, text, msg_date)
 
             # Save data changes to disk
             db_conn.commit()
@@ -188,13 +183,7 @@ async def scrape_active_channels():
 
             # 4. If new logs dropped, update the Supabase state tracker for next time
             if new_high_water_mark > min_id:
-                supabase.table("checkpoint_scraper_config") \
-                    .update({
-                        "last_message_id": new_high_water_mark, 
-                        "last_scraped_at": datetime.now(timezone.utc).isoformat()
-                    }) \
-                    .eq("checkpoint_id", cp_id) \
-                    .execute()
+                update_supabase_state(supabase, cp_id, new_high_water_mark)
                 logger.info(f"-> Supabase updated: {cp_id} state high_water mark pushed to {new_high_water_mark}.")
 
         except Exception as e:
@@ -207,3 +196,5 @@ async def scrape_active_channels():
 
 if __name__ == "__main__":
     asyncio.run(scrape_active_channels())
+    logger.info("★ Starting LLM Extraction Phase ★")
+    process_all_checkpoints()

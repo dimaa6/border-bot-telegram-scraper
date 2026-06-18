@@ -1,0 +1,4 @@
+telethon
+supabase
+google-genai
+pydantic
