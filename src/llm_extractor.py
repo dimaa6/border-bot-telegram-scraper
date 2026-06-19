@@ -9,8 +9,12 @@ from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 from config_matrix import ConfigMatrix
-from supabase_client import get_supabase_client, get_active_checkpoints
+from supabase_client import get_supabase_client, get_active_checkpoints, get_previous_estimates, insert_time_stats
 from nakordoni_client import fetch_nakordoni_data, match_checkpoint_with_nakordoni
+
+# Hard minimum crossing times — enforced in code after LLM response, regardless of queue size
+MIN_OUTBOUND_MINUTES = 60  # Leaving Ukraine → Poland: exit control + customs + crossing + Schengen/Polish entry
+MIN_INBOUND_MINUTES  = 20  # Entering Ukraine ← Poland: Polish exit + crossing + Ukrainian entry control
 
 # --- LOGGING SETUP ---
 os.makedirs("logs", exist_ok=True)
@@ -36,8 +40,8 @@ logger.addHandler(console_handler)
 class DirectionalMetrics(BaseModel):
     # Keep the scratchpad as the first field so the model executes its logic before assigning numbers
     ai_step_by_step_analysis: str = Field(
-        ..., 
-        description="Mandatory logical scratchpad. Analyze and state: 1) Exterior queue size/landmark, 2) Interior terminal delays, and 3) The total math sum."
+        ...,
+        description="Mandatory logical scratchpad. State: 1) API queue count and base estimate math, 2) Terminal delay from chat (additive minutes), 3) Completed crossing calibration signal if any, 4) Anomaly adjustments applied, 5) Smoothing check vs previous estimate, 6) Final total with hard floor applied."
     )
     
     cars_queue_size: Optional[int] = Field(
@@ -53,37 +57,33 @@ class DirectionalMetrics(BaseModel):
     summary_insight: Optional[str] = Field(None, description="A highly concise summary sentence explaining current conditions, written in Ukrainian.")
 
 class BorderCheckpointMetrics(BaseModel):
-    from_ukraine: DirectionalMetrics = Field(
+    from_ukraine: Optional[DirectionalMetrics] = Field(
         None, description="Traffic data leaving Ukraine toward the neighboring country (e.g., 'до Польщі', 'в сторону ПЛ', 'на виїзд')."
     )
-    to_ukraine: DirectionalMetrics = Field(
+    to_ukraine: Optional[DirectionalMetrics] = Field(
         None, description="Traffic data entering Ukraine from abroad (e.g., 'додому', 'в Україну', 'на в'їзд')."
     )
 
-def parse_latest_messages(checkpoint_id: str, config_matrix: ConfigMatrix, matched_nakordoni: dict):
-    # 2. Load configurations from your JSON file
-    CONFIG_PATH = os.path.join("config", "scraper_config.toml")
-    with open(CONFIG_PATH, "rb") as f:
-        config_data = tomllib.load(f)
-    
-    gemini_key = config_data["gemini"]["api_key"]
-    retry_interval = int(config_data["gemini"].get("retry_interval", 30))
-    retry_number = int(config_data["gemini"].get("retry_number", 3))
-    
-    # 3. Initialize the official modern GenAI SDK Client
-    ai_client = genai.Client(api_key=gemini_key)
+def parse_latest_messages(checkpoint_id: str, config_matrix: ConfigMatrix, matched_nakordoni: dict,
+                          ai_client: genai.Client, retry_interval: int, retry_number: int,
+                          supabase):
     
     # 4. Extract the chronological sliding window text from your local SQLite cache
     db_conn = sqlite3.connect('db/border-bot-telegram-scraper.db')
     cursor = db_conn.cursor()
     
     # Let's fetch the last 30 raw text messages for the specified channel
+    # Fetch the 30 most recent messages, then sort chronologically in SQL
     cursor.execute('''
         SELECT message_id, message_text, recorded_at, reply_to_msg_id
-        FROM message_log 
-        WHERE checkpoint_id = ? 
-        ORDER BY recorded_at DESC 
-        LIMIT 30
+        FROM (
+            SELECT message_id, message_text, recorded_at, reply_to_msg_id
+            FROM message_log
+            WHERE checkpoint_id = ?
+            ORDER BY recorded_at DESC
+            LIMIT 30
+        )
+        ORDER BY recorded_at ASC
     ''', (checkpoint_id,))
     
     rows = cursor.fetchall()
@@ -98,7 +98,7 @@ def parse_latest_messages(checkpoint_id: str, config_matrix: ConfigMatrix, match
     
     # Second pass: Build a highly structured transcript timeline for the LLM
     transcript_lines = []
-    for msg_id, text, timestamp, reply_to_msg_id in reversed(rows):
+    for msg_id, text, timestamp, reply_to_msg_id in rows:
         clean_text = text.replace('\n', ' ')
         
         # Reconstruct structural context if the message is an active reply
@@ -114,68 +114,119 @@ def parse_latest_messages(checkpoint_id: str, config_matrix: ConfigMatrix, match
             
         transcript_lines.append(context_string)
     
-    raw_transcript = "\n".join(transcript_lines)    
+    raw_transcript = "\n".join(transcript_lines)
+
+    # Fetch the most recent previous estimates to use as a smoothing anchor
+    try:
+        prev_outbound, prev_inbound = get_previous_estimates(supabase, checkpoint_id)
+    except Exception as e:
+        logger.warning(f"⚠️ Could not fetch previous estimates for {checkpoint_id}: {e}")
+        prev_outbound = None
+        prev_inbound  = None
+
+    def _fmt_prev(row) -> str:
+        if row is None:
+            return "N/A — compute freely"
+        mins  = row.get('duration_minutes', 'N/A')
+        queue = row.get('cars_queue_size',  'N/A')
+        ts    = str(row.get('recorded_at', ''))[:16]
+        return f"{mins} min wait, {queue} cars in queue (at {ts} UTC)"
+
+    prev_outbound_str = _fmt_prev(prev_outbound)
+    prev_inbound_str  = _fmt_prev(prev_inbound)
 
     # 5. Build a deterministic analytical prompt
-    system_instruction = "You are a border customs logistics analyzer. Your task is to calculate the absolute cumulative transit time a new vehicle arrival faces right now."
-
-    # {profile["landmark_rules"]}
-    # {profile["throughput_cars_per_hour"]}
+    system_instruction = "You are a border crossing wait time estimator. Your task is to compute the realistic total wait time a new vehicle arrival faces right now, using sensor queue data as the primary baseline and crowdsourced chat as a source of supplementary delay information."
 
     throughput = 15
-    landmark_rules = "undefined"
+    landmark_rules = None
 
     if config_matrix.ai_heuristics:
         if config_matrix.ai_heuristics.throughput:
             throughput = config_matrix.ai_heuristics.throughput
         if config_matrix.ai_heuristics.landmark_rules:
             landmark_rules = config_matrix.ai_heuristics.landmark_rules
-            
+
+    landmark_section = (
+        f"LOCAL LANDMARK HEURISTICS:\n    {landmark_rules}"
+        if landmark_rules
+        else "LOCAL LANDMARK HEURISTICS:\n    None defined — rely solely on API counts and chat mentions."
+    )
+
     nakordoni_inbound = matched_nakordoni.get("INBOUND")
     nakordoni_outbound = matched_nakordoni.get("OUTBOUND")
-    
+
     inbound_queue = f"{nakordoni_inbound.queue} cars" if nakordoni_inbound and nakordoni_inbound.queue is not None else "Unknown"
     outbound_queue = f"{nakordoni_outbound.queue} cars" if nakordoni_outbound and nakordoni_outbound.queue is not None else "Unknown"
-    
+
+    now_utc = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+
     prompt = f"""
-    You are resolving a border checkpoint wait timeline. You have been provided with two data streams:
-    1. STRUCTURED BASELINE: Official/sensor metrics.
-    2. UNSTRUCTURED GROUND TRUTH: Real-time user logs from crowdsourced chats.
-
     BASE DATA MATRIX FOR THIS RUN:
-    - API Reported Cars in Queue: Inbound {inbound_queue}, Outbound {outbound_queue} vehicles
+    - Current Time (UTC): {now_utc}
+    - API Reported Cars in Queue (sensor-based, primary source):
+      OUTBOUND (leaving Ukraine): {outbound_queue}
+      INBOUND  (entering Ukraine): {inbound_queue}
 
-    LOCAL LANDMARK HEURISTICS:
-    {landmark_rules}
+    {landmark_section}
 
     CHECKPOINT THROUGHPUT:
-    Assume a baseline processing rate of {throughput} cars per hour under normal conditions.
+    Baseline processing rate: {throughput} cars per hour under normal conditions.
 
-    PROCESSING METHODOLOGY:
-    1. Reconcile Vehicle Counts: Look at the 'API Reported Cars' vs. the chat mentions. If recent chat logs name a physical landmark, use the landmark heuristic count as your base 'cars_queue_size'.
-    If chat logs mention exact queue size, use it. Otherwise, accept the API counts.
-    2. Evaluate Internal Terminal Stagnation: Read the chat text for bottlenecks *inside* the checkpoint lines (e.g., 'стоїмо на території більше години'). The baseline API does not calculate this
-    fully. You must parse these time durations explicitly.
-    3. Compute Total Delay: Combine your reconciled car wait time with the parsed internal terminal bottleneck.
-    4. Apply Sentiment Friction: Multiply your final projection by 1.5x if chat sentiment describes a mild slowdown, and 2.0x if describing a severe jam or standstill.
-    5. Anchor Ambient Ambiguity: If a chat message describes a status, queue, or internal lane count (e.g., "на території по 7-8 машин на двох пасах") but does NOT explicitly state the direction,
-    you are STRICTLY PROHIBITED from guessing or assuming it applies to the Inbound direction. If the conversation context is ambiguous, attribute it to the Outbound direction by default, or
-    discard it entirely if it contradicts verified directional metrics.
+    PROCESSING METHODOLOGY — follow these steps in order:
 
-    CRITICAL BIAS & ANCHORING RULES:
-    1. STRICT ASSIGNMENT ONLY: Do not engage in gap-filling. If a specific traffic metric or text mention lacks a clear directional qualifier (e.g., "додому", "в UA" vs "до ПЛ", "на виїзд"), never
-    guess or assume it applies to the Inbound (entering Ukraine) direction. 
-    2. DIRECTIONAL ASSIGNMENT BIAS: Ground truth reports from Telegram always take priority over the official API baseline when they are clear. However, because leaving Ukraine toward Poland
-    (Outbound) is structurally the much slower direction and prone to internal terminal delays, any vague, unanchored chat metrics (e.g., "7-8 cars on two lanes" or "5 cars inside") must be
-    assumed to apply to the Outbound direction by default. Never assign ambiguous or directionless data to the Inbound (entering Ukraine) direction, as doing so unrealistically inflates wait
-    times for what is typically a much faster flow.
-    3. NO DOUBLE-COUNTING OVERLAPS: If a chat participant clarifies or updates a count (e.g., specifying that "машини на території" applies to Poland), do not split or re-assign other segments of
-    that same text statement to the opposite direction without explicit textual proof.
-    4. If the chat logs do not mention a direction, do NOT leave the direction null. Evaluate the 'API Reported Cars' baseline against the default processing throughput rate, and populate the metrics
-    accordingly using that mathematical baseline.
+    STEP 1 — BASE ESTIMATE FROM API (primary signal):
+    The API queue count is sensor-based and independently verified as accurate.
+    Compute base wait time: base_minutes = (api_queue_cars / throughput_per_hour) * 60
+    A large API queue implicitly signals slow internal processing, not just an external line.
+    Set cars_queue_size to the API-reported value for that direction.
 
-    CRITICAL ALIGNMENT RULES:
-    1. Every metric property in the JSON output MUST align exactly with the conclusions reached in your 'ai_step_by_step_analysis'.
+    STEP 2 — TERMINAL DELAY FROM CHAT (additive):
+    Scan chat for reports of waiting inside the checkpoint territory after passing the external gate.
+    Examples: 'стоїмо на території більше години', 'на митниці стоїмо', 'на території по 7-8 машин'.
+    The API does not measure internal terminal delays — chat is the only source for this.
+    Extract the stated duration and ADD it to the Step 1 base. Do not double-count delays
+    already implied by a large API queue.
+
+    STEP 3 — COMPLETED CROSSING CALIBRATION:
+    If any chat message from the last 90 minutes reports a completed crossing
+    (e.g., 'щойно пройшли за 1.5 год', 'за 2 години пройшли', 'проїхали за годину'),
+    treat it as a high-confidence real-world calibration. Adjust your estimate toward this value
+    since it reflects the full crossing experience including all terminal delays.
+
+    STEP 4 — ANOMALY ADJUSTMENTS (additive only, never multiplicative):
+    Apply these adjustments for confirmed directional anomalies:
+      Extra lane opened:              -15 min
+      Lane reduced or closed:        +20 min
+      Police / inspection activity:  +30 min
+      Complete standstill (>30 min): +45 min
+    Do NOT apply any multipliers. All adjustments are additive minutes only.
+
+    STEP 5 — SMOOTHING ANCHOR:
+    Border conditions do not change drastically within 2 hours. Your new estimate must
+    stay within ±90 minutes of the previous estimate UNLESS you can cite at least 2
+    independent, recent (within 90 min) chat messages confirming a significantly different
+    situation. If only 1 such message exists, limit deviation to ±45 minutes.
+
+    PREVIOUS ESTIMATES (~2 hours ago — use as smoothing anchor):
+      OUTBOUND: {prev_outbound_str}
+      INBOUND:  {prev_inbound_str}
+
+    HARD MINIMUM FLOORS (apply even if queue is empty — non-negotiable):
+      OUTBOUND (leaving Ukraine): minimum 60 minutes
+        Reason: Ukrainian exit control + customs + crossing + Schengen/Polish entry.
+      INBOUND  (entering Ukraine): minimum 20 minutes
+        Reason: Polish exit + crossing + Ukrainian entry control.
+
+    DIRECTIONAL ASSIGNMENT RULES:
+    1. Assign data to a direction only when it carries an explicit qualifier
+       ('додому'/'в Україну' = INBOUND; 'до Польщі'/'на виїзд' = OUTBOUND).
+    2. Queue/lane data with NO directional qualifier → assign to OUTBOUND by default.
+    3. Do NOT leave a direction null — if chat is silent for a direction, use API math from Step 1.
+    4. Do NOT assign the same text segment to both directions.
+
+    CRITICAL ALIGNMENT RULE:
+    Every numeric value in the JSON output MUST be consistent with your ai_step_by_step_analysis.
 
     CHAT TRANSCRIPT LOGS:
     {raw_transcript}
@@ -204,7 +255,7 @@ def parse_latest_messages(checkpoint_id: str, config_matrix: ConfigMatrix, match
                 raise
             logger.warning(f"⚠️ 503 Service Unavailable encountered. Retrying in {current_wait} seconds (Attempt {attempt + 1}/{retry_number})...")
             time.sleep(current_wait)
-            current_wait = current_wait ** 2
+            current_wait = current_wait * 2
 
     prompt_tokens = response.usage_metadata.prompt_token_count
     completion_tokens = response.usage_metadata.candidates_token_count
@@ -238,6 +289,18 @@ def parse_latest_messages(checkpoint_id: str, config_matrix: ConfigMatrix, match
     return extracted_data
 
 def process_all_checkpoints():
+    # Load configuration once and reuse across all checkpoint calls
+    CONFIG_PATH = os.path.join("config", "scraper_config.toml")
+    with open(CONFIG_PATH, "rb") as f:
+        config_data = tomllib.load(f)
+
+    gemini_key = config_data["gemini"]["api_key"]
+    retry_interval = int(config_data["gemini"].get("retry_interval", 30))
+    retry_number = int(config_data["gemini"].get("retry_number", 3))
+
+    # Initialize the Gemini client once and reuse it for all checkpoints
+    ai_client = genai.Client(api_key=gemini_key)
+
     supabase = get_supabase_client()
     checkpoints = get_active_checkpoints(supabase)
 
@@ -245,17 +308,16 @@ def process_all_checkpoints():
     nakordoni_data = fetch_nakordoni_data()
     logger.info(f"Fetched data for {len(nakordoni_data)} checkpoints from Nakordoni.")
 
-    # Test your logic against all active channels
-    for cp in checkpoints:
+    for i, cp in enumerate(checkpoints):
         checkpoint_id = cp["checkpoint_id"]
-        
+
         raw_matrix = cp.get("config_matrix") or {}
         config_matrix = ConfigMatrix(**raw_matrix)
-        
+
         matched_nakordoni = match_checkpoint_with_nakordoni(config_matrix, nakordoni_data)
-        
+
         logger.info(f"Processing checkpoint: {checkpoint_id}")
-        metrics = parse_latest_messages(checkpoint_id, config_matrix, matched_nakordoni)
+        metrics = parse_latest_messages(checkpoint_id, config_matrix, matched_nakordoni, ai_client, retry_interval, retry_number, supabase)
         
         if metrics:
             logger.info(f"★ SUCCESS! Type-Safe Metrics Extracted by Gemini for {checkpoint_id} ★")
@@ -263,10 +325,12 @@ def process_all_checkpoints():
             stats_to_insert = []
 
             if metrics.from_ukraine:
+                outbound_raw_min = int(metrics.from_ukraine.estimated_total_delay_hours * 60) if metrics.from_ukraine.estimated_total_delay_hours is not None else MIN_OUTBOUND_MINUTES
+                outbound_duration = max(outbound_raw_min, MIN_OUTBOUND_MINUTES)
                 logger.info("--- FROM UKRAINE (OUTBOUND) ---")
                 logger.info(f"AI step analysis:  {metrics.from_ukraine.ai_step_by_step_analysis}")
                 logger.info(f"Cars Queue Size:   {metrics.from_ukraine.cars_queue_size}")
-                logger.info(f"Estimated Delay:   {metrics.from_ukraine.estimated_total_delay_hours} hours")
+                logger.info(f"Estimated Delay:   {metrics.from_ukraine.estimated_total_delay_hours} hours (raw) → {outbound_duration} min (floor={MIN_OUTBOUND_MINUTES}min)")
                 logger.info(f"Is Jammed:         {metrics.from_ukraine.is_jammed}")
                 logger.info(f"Is Warning:        {metrics.from_ukraine.is_warning}")
                 logger.info(f"AI Insight:        {metrics.from_ukraine.summary_insight}")
@@ -275,15 +339,18 @@ def process_all_checkpoints():
                     "checkpoint_id": checkpoint_id,
                     "direction": "OUTBOUND",
                     "transport_type": "car",
-                    "duration_minutes": int(metrics.from_ukraine.estimated_total_delay_hours * 60) if metrics.from_ukraine.estimated_total_delay_hours is not None else None,
+                    "duration_minutes": outbound_duration,
+                    "cars_queue_size": metrics.from_ukraine.cars_queue_size,
                     "comment": metrics.from_ukraine.summary_insight
                 })
 
             if metrics.to_ukraine:
+                inbound_raw_min = int(metrics.to_ukraine.estimated_total_delay_hours * 60) if metrics.to_ukraine.estimated_total_delay_hours is not None else MIN_INBOUND_MINUTES
+                inbound_duration = max(inbound_raw_min, MIN_INBOUND_MINUTES)
                 logger.info("--- TO UKRAINE (INBOUND) ---")
                 logger.info(f"AI step analysis:  {metrics.to_ukraine.ai_step_by_step_analysis}")
                 logger.info(f"Cars Queue Size:   {metrics.to_ukraine.cars_queue_size}")
-                logger.info(f"Estimated Delay:   {metrics.to_ukraine.estimated_total_delay_hours} hours")
+                logger.info(f"Estimated Delay:   {metrics.to_ukraine.estimated_total_delay_hours} hours (raw) → {inbound_duration} min (floor={MIN_INBOUND_MINUTES}min)")
                 logger.info(f"Is Jammed:         {metrics.to_ukraine.is_jammed}")
                 logger.info(f"Is Warning:        {metrics.to_ukraine.is_warning}")
                 logger.info(f"AI Insight:        {metrics.to_ukraine.summary_insight}")
@@ -292,19 +359,21 @@ def process_all_checkpoints():
                     "checkpoint_id": checkpoint_id,
                     "direction": "INBOUND",
                     "transport_type": "car",
-                    "duration_minutes": int(metrics.to_ukraine.estimated_total_delay_hours * 60) if metrics.to_ukraine.estimated_total_delay_hours is not None else None,
+                    "duration_minutes": inbound_duration,
+                    "cars_queue_size": metrics.to_ukraine.cars_queue_size,
                     "comment": metrics.to_ukraine.summary_insight
                 })
 
             if stats_to_insert:
                 try:
-                    supabase.table("time_stat").insert(stats_to_insert).execute()
+                    insert_time_stats(supabase, stats_to_insert)
                     logger.info(f"-> Saved {len(stats_to_insert)} records to 'time_stat' table in Supabase.")
                 except Exception as e:
                     logger.error(f"❌ Error saving to Supabase 'time_stat' table: {e}", exc_info=True)
 
-        logger.info("Sleeping for 10 seconds to respect API RPM limits...")
-        time.sleep(10)
+        if i < len(checkpoints) - 1:
+            logger.info("Sleeping for 10 seconds to respect API RPM limits...")
+            time.sleep(10)
 
 if __name__ == "__main__":
     process_all_checkpoints()
