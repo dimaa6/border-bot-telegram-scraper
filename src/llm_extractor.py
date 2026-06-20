@@ -2,6 +2,7 @@ import os
 import sqlite3
 import tomllib
 import time
+import random
 import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
@@ -250,11 +251,14 @@ def parse_latest_messages(checkpoint_id: str, config_matrix: ConfigMatrix, match
             )
             break  # Success, exit the retry loop
         except Exception as e:
-            if '503' not in str(e) or attempt == retry_number:
+            err_str = str(e)
+            is_retryable = '503' in err_str or '429' in err_str
+            if not is_retryable or attempt == retry_number:
                 logger.error(f"❌ Failed API call to Gemini after {attempt} retries: {e}")
                 raise
-            logger.warning(f"⚠️ 503 Service Unavailable encountered. Retrying in {current_wait} seconds (Attempt {attempt + 1}/{retry_number})...")
-            time.sleep(current_wait)
+            error_label = "429 Too Many Requests" if '429' in err_str else "503 Service Unavailable"
+            logger.warning(f"⚠️ {error_label} — retrying in {current_wait}s ±25% (attempt {attempt + 1}/{retry_number})...")
+            time.sleep(random.uniform(current_wait * 0.75, current_wait * 1.25))
             current_wait = current_wait * 2
 
     prompt_tokens = response.usage_metadata.prompt_token_count
@@ -372,8 +376,9 @@ def process_all_checkpoints():
                     logger.error(f"❌ Error saving to Supabase 'time_stat' table: {e}", exc_info=True)
 
         if i < len(checkpoints) - 1:
-            logger.info("Sleeping for 10 seconds to respect API RPM limits...")
-            time.sleep(10)
+            sleep_secs = random.uniform(45, 75)
+            logger.info(f"Sleeping {sleep_secs:.1f}s before next checkpoint (jittered, to respect API RPM limits)...")
+            time.sleep(sleep_secs)
 
 if __name__ == "__main__":
     process_all_checkpoints()
