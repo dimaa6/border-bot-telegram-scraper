@@ -39,23 +39,17 @@ logger.addHandler(console_handler)
 
 # 1. Define the directional schema for a single traffic flow
 class DirectionalMetrics(BaseModel):
-    # Keep the scratchpad as the first field so the model executes its logic before assigning numbers
-    ai_step_by_step_analysis: str = Field(
-        ...,
-        description="Mandatory logical scratchpad. State: 1) API queue count and base estimate math, 2) Terminal delay from chat (additive minutes), 3) Completed crossing calibration signal if any, 4) Anomaly adjustments applied, 5) Smoothing check vs previous estimate, 6) Final total with hard floor applied."
-    )
-    
     cars_queue_size: Optional[int] = Field(
         None, description="Total passenger cars waiting outside the gates. Convert named landmarks to counts using your prompt definitions."
     )
     
     estimated_total_delay_hours: Optional[float] = Field(
-        None, description="Total projected wait time in hours for a new arrival to fully cross, matching your scratchpad calculation."
+        None, description="Total projected wait time in hours for a new arrival to fully cross, following the methodology steps."
     )
     
     is_jammed: bool = Field(..., description="True if total projected wait time > 3 hours or movement is at a complete standstill.")
     is_warning: bool = Field(..., description="True if there is an increasing queue, long internal wait, or notable traffic friction.")
-    summary_insight: Optional[str] = Field(None, description="A highly concise summary sentence explaining current conditions, written in Ukrainian.")
+    summary_insight: Optional[str] = Field(None, description="A concise 1-sentence summary of current conditions, written in Ukrainian, briefly explaining the key factor behind the estimate.")
 
 class BorderCheckpointMetrics(BaseModel):
     from_ukraine: Optional[DirectionalMetrics] = Field(
@@ -246,7 +240,13 @@ def parse_latest_messages(checkpoint_id: str, config_matrix: ConfigMatrix, match
                     # These two parameters force the structured JSON extraction matching our Pydantic class
                     response_mime_type="application/json",
                     response_schema=BorderCheckpointMetrics,
-                    temperature=0.1,  # Low temperature for highly deterministic analytical extractions
+                    temperature=1,  # Must be 1 when thinking_config is used (Gemini requirement)
+                    thinking_config=types.ThinkingConfig(
+                        # Internal chain-of-thought budget: model reasons through all 5 steps
+                        # before producing the JSON. Thinking tokens are cheaper than output tokens
+                        # and don't pollute the structured response schema.
+                        thinking_budget=8192,
+                    ),
                 ),
             )
             break  # Success, exit the retry loop
@@ -261,21 +261,29 @@ def parse_latest_messages(checkpoint_id: str, config_matrix: ConfigMatrix, match
             time.sleep(random.uniform(current_wait * 0.75, current_wait * 1.25))
             current_wait = current_wait * 2
 
-    prompt_tokens = response.usage_metadata.prompt_token_count
+    prompt_tokens     = response.usage_metadata.prompt_token_count
     completion_tokens = response.usage_metadata.candidates_token_count
-    total_tokens = response.usage_metadata.total_token_count
+    thinking_tokens   = getattr(response.usage_metadata, 'thoughts_token_count', 0) or 0
+    total_tokens      = response.usage_metadata.total_token_count
 
     logger.info("----------------------------------------")
     logger.info("📊 API TOKEN CONSUMPTION REPORT")
     logger.info("----------------------------------------")
-    logger.info(f"Input Tokens (Transcript + Prompt): {prompt_tokens}")
-    logger.info(f"Output Tokens (Gemini's JSON):     {completion_tokens}")
-    logger.info(f"Total Session Tokens Consumed:     {total_tokens}")
+    logger.info(f"Input Tokens  (Transcript + Prompt): {prompt_tokens}")
+    logger.info(f"Thinking Tokens (internal CoT):      {thinking_tokens}")
+    logger.info(f"Output Tokens (Gemini's JSON):       {completion_tokens}")
+    logger.info(f"Total Session Tokens Consumed:       {total_tokens}")
     logger.info("----------------------------------------")
 
     # The SDK automatically handles verification and transforms the raw JSON response
     # right back into a concrete object matching your Pydantic schema structure!
     extracted_data = response.parsed
+    if extracted_data is None:
+        raw_text = getattr(response, 'text', None) or str(response)
+        logger.error(
+            f"❌ response.parsed is None for {checkpoint_id} — Pydantic validation failed or model returned non-JSON.\n"
+            f"Raw response text (first 1000 chars):\n{raw_text[:1000] if raw_text else '<empty>'}"
+        )
 
     # Clean up messages older than 24 hours using the existing open connection
     cutoff_time = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
@@ -332,7 +340,6 @@ def process_all_checkpoints():
                 outbound_raw_min = int(metrics.from_ukraine.estimated_total_delay_hours * 60) if metrics.from_ukraine.estimated_total_delay_hours is not None else MIN_OUTBOUND_MINUTES
                 outbound_duration = max(outbound_raw_min, MIN_OUTBOUND_MINUTES)
                 logger.info("--- FROM UKRAINE (OUTBOUND) ---")
-                logger.info(f"AI step analysis:  {metrics.from_ukraine.ai_step_by_step_analysis}")
                 logger.info(f"Cars Queue Size:   {metrics.from_ukraine.cars_queue_size}")
                 logger.info(f"Estimated Delay:   {metrics.from_ukraine.estimated_total_delay_hours} hours (raw) → {outbound_duration} min (floor={MIN_OUTBOUND_MINUTES}min)")
                 logger.info(f"Is Jammed:         {metrics.from_ukraine.is_jammed}")
@@ -352,7 +359,6 @@ def process_all_checkpoints():
                 inbound_raw_min = int(metrics.to_ukraine.estimated_total_delay_hours * 60) if metrics.to_ukraine.estimated_total_delay_hours is not None else MIN_INBOUND_MINUTES
                 inbound_duration = max(inbound_raw_min, MIN_INBOUND_MINUTES)
                 logger.info("--- TO UKRAINE (INBOUND) ---")
-                logger.info(f"AI step analysis:  {metrics.to_ukraine.ai_step_by_step_analysis}")
                 logger.info(f"Cars Queue Size:   {metrics.to_ukraine.cars_queue_size}")
                 logger.info(f"Estimated Delay:   {metrics.to_ukraine.estimated_total_delay_hours} hours (raw) → {inbound_duration} min (floor={MIN_INBOUND_MINUTES}min)")
                 logger.info(f"Is Jammed:         {metrics.to_ukraine.is_jammed}")
