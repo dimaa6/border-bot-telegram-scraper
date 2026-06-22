@@ -13,7 +13,7 @@ services:
     volumes:
       - "${SCRAPER_LOG_DIR:-./logs}:/app/logs"
       - "${SCRAPER_DB_DIR:-./db}:/app/db"
-      - "${SCRAPER_TG_SESSION:-./bbhelper.session}:/app/bbhelper.session"
+      - "${SCRAPER_TG_SESSION:-./bbhelper.session}:/app/db/bbhelper.session"
     command: ["sleep", "infinity"]
 
   scheduler:
@@ -29,5 +29,5 @@ services:
       ofelia.enabled: "true"
       ofelia.job-exec.border-scraper-cron.schedule: "0 10 */2 * * *"
       ofelia.job-exec.border-scraper-cron.container: "border-bot-scraper"
-      ofelia.job-exec.border-scraper-cron.command: "python src/scraper.py"
+      ofelia.job-exec.border-scraper-cron.command: "flock -n /app/lock/scraper.lock python src/scraper.py"
       ofelia.job-exec.border-scraper-cron.no-overlap: "true"
