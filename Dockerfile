@@ -10,13 +10,13 @@ ARG GROUP_ID=1000
 
 RUN addgroup -g ${GROUP_ID} appgroup && adduser -D -u ${USER_ID} -G appgroup appuser
 
-RUN mkdir -p /app/db /app/logs && chown -R appuser:appgroup /app/db /app/logs
+RUN mkdir -p /app/db /app/logs /app/lock && chown -R appuser:appgroup /app/db /app/logs /app/lock
 
 COPY requirements.txt .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY --chown=appuser:appgroup . .
+COPY . .
 
 USER appuser
 

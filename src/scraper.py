@@ -34,6 +34,7 @@ _ignore_raw = os.getenv("IGNORE_USERS", "")
 IGNORE_USERS = [u.strip().lower().lstrip('@') for u in _ignore_raw.split(',') if u.strip()]
 
 DB_PATH = os.getenv("DB_PATH", "db/border-bot-telegram-scraper.db")
+TELEGRAM_SESSION_FILE = os.getenv("TELEGRAM_SESSION_FILE", "bbhelper.session")
 
 # Initialize Supabase Admin Client
 supabase = get_supabase_client()
@@ -98,9 +99,8 @@ async def scrape_active_channels():
     db_cursor = db_conn.cursor()
 
     # 3. Boot up the Telegram client
-    # This creates a persistent file named 'scraper.session' in your current directory
     client = TelegramClient(
-        'bbhelper', 
+        TELEGRAM_SESSION_FILE, 
         TELEGRAM_API_ID, 
         TELEGRAM_API_HASH,
         device_model="Web",

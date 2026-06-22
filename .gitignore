@@ -6,3 +6,4 @@ config/
 logs/
 *.session
 .env
+db_scripts/*.py

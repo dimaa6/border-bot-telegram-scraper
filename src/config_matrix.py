@@ -9,7 +9,9 @@ class NakordoniMapping(BaseModel):
     car: Optional[NakordoniCarMapping] = None
 
 class AIHeuristics(BaseModel):
-    throughput: Optional[int] = None
+    inbound_throughput: Optional[int] = None
+    outbound_throughput: Optional[int] = None
+    territory_capacity: Optional[int] = None  # Physical car slots inside checkpoint territory
     landmark_rules: Optional[str] = None
 
 class ConfigMatrix(BaseModel):
