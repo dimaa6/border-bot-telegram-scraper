@@ -1,14 +1,14 @@
 import os
 import sqlite3
-import tomllib
+from dotenv import load_dotenv
 import time
 import random
-import logging
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
+from log_setup import configure_logging
 from config_matrix import ConfigMatrix
 from supabase_client import get_supabase_client, get_active_checkpoints, get_previous_estimates, insert_time_stats
 from nakordoni_client import fetch_nakordoni_data, match_checkpoint_with_nakordoni
@@ -18,24 +18,7 @@ MIN_OUTBOUND_MINUTES = 60  # Leaving Ukraine → Poland: exit control + customs 
 MIN_INBOUND_MINUTES  = 20  # Entering Ukraine ← Poland: Polish exit + crossing + Ukrainian entry control
 
 # --- LOGGING SETUP ---
-os.makedirs("logs", exist_ok=True)
-
-log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-
-# File Handler
-file_handler = logging.FileHandler(
-    os.path.join("logs", "llm_extractor.log"),
-    encoding="utf-8"
-)
-file_handler.setFormatter(log_formatter)
-
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(log_formatter)
-
-logger = logging.getLogger("llm_extractor")
-logger.setLevel(logging.INFO)
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
+logger = configure_logging("llm_extractor.log")
 
 # 1. Define the directional schema for a single traffic flow
 class DirectionalMetrics(BaseModel):
@@ -302,13 +285,13 @@ def parse_latest_messages(checkpoint_id: str, config_matrix: ConfigMatrix, match
 
 def process_all_checkpoints():
     # Load configuration once and reuse across all checkpoint calls
-    CONFIG_PATH = os.path.join("config", "scraper_config.toml")
-    with open(CONFIG_PATH, "rb") as f:
-        config_data = tomllib.load(f)
+    load_dotenv()
 
-    gemini_key = config_data["gemini"]["api_key"]
-    retry_interval = int(config_data["gemini"].get("retry_interval", 30))
-    retry_number = int(config_data["gemini"].get("retry_number", 3))
+    gemini_key = os.getenv("GEMINI_API_KEY")
+    if not gemini_key:
+        raise EnvironmentError("Critical error: GEMINI_API_KEY is not set in the .env file.")
+    retry_interval = int(os.getenv("GEMINI_RETRY_INTERVAL", "30"))
+    retry_number = int(os.getenv("GEMINI_RETRY_NUMBER", "3"))
 
     # Initialize the Gemini client once and reuse it for all checkpoints
     ai_client = genai.Client(api_key=gemini_key)

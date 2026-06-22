@@ -1,5 +1,4 @@
 import os
-import tomllib
 import json
 import logging
 import urllib.request
@@ -42,16 +41,12 @@ class NakordoniResponse(BaseModel):
 
 def fetch_nakordoni_data() -> Dict[str, NakordoniCheckpoint]:
     """
-    Pulls border queue data from Nakordoni API using the API key from scraper_config.toml.
+    Pulls border queue data from Nakordoni API using the NAKORDONI_API_KEY env var.
     Returns a dictionary of NakordoniCheckpoint objects keyed by their ppid.
     """
-    config_path = os.path.join("config", "scraper_config.toml")
-    try:
-        with open(config_path, "rb") as f:
-            config_data = tomllib.load(f)
-        api_key = config_data["nakordoni"]["api_key"]
-    except Exception as e:
-        logger.error(f"Failed to load Nakordoni API key from config: {e}")
+    api_key = os.getenv("NAKORDONI_API_KEY")
+    if not api_key:
+        logger.error("Failed to load Nakordoni API key: NAKORDONI_API_KEY is not set in the .env file.")
         return {}
 
     url = "https://nakordoni.eu/api/v1/data/border/1/all/4"

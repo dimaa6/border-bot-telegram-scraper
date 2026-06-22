@@ -2,19 +2,17 @@ import os
 import json
 import asyncio
 from telethon import TelegramClient, errors
-import tomllib
+from dotenv import load_dotenv
 import qrcode
 
-
-CONFIG_PATH = os.path.join("config", "scraper_config.toml")
+load_dotenv()
 
 async def login_with_qr():
     # 1. Load your credentials
-    with open(CONFIG_PATH, "rb") as f:
-        config_data = tomllib.load(f)
-    
-    api_id = int(config_data["telegram_app"]["id"])
-    api_hash = str(config_data["telegram_app"]["hash"])
+    api_id = int(os.getenv("TELEGRAM_ID", "") or "")
+    api_hash = os.getenv("TELEGRAM_HASH", "")
+    if not api_id or not api_hash:
+        raise EnvironmentError("TELEGRAM_ID and TELEGRAM_HASH must be set in the .env file.")
     print(api_id, api_hash)
     
     # 2. Initialize a fresh client session template

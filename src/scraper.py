@@ -1,55 +1,53 @@
 import os
 import asyncio
 import sqlite3
-import logging
 from datetime import datetime, timezone, timedelta
 from telethon import TelegramClient
-import tomllib  # Built-in for Python 3.11+
+from dotenv import load_dotenv
+from log_setup import configure_logging
 from supabase_client import get_supabase_client, get_active_checkpoints, update_supabase_state
 from llm_extractor import process_all_checkpoints
 
 # --- LOGGING SETUP ---
-os.makedirs("logs", exist_ok=True)
+logger = configure_logging("scraper.log")
 
-log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+# --- CONFIGURATION LOADING FROM .env ---
+load_dotenv()
 
-# File Handler
-file_handler = logging.FileHandler(
-    os.path.join("logs", "scraper.log"),
-    encoding="utf-8"
-)
-file_handler.setFormatter(log_formatter)
+_telegram_id_raw = os.getenv("TELEGRAM_ID")
+_telegram_hash_raw = os.getenv("TELEGRAM_HASH")
 
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(log_formatter)
-
-logger = logging.getLogger("scraper")
-logger.setLevel(logging.INFO)
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
-
-# --- CONFIGURATION LOADING FROM TOML ---
-CONFIG_PATH = os.path.join("config", "scraper_config.toml")
+if not _telegram_id_raw:
+    raise EnvironmentError("Critical error: TELEGRAM_ID is not set in the .env file.")
+if not _telegram_hash_raw:
+    raise EnvironmentError("Critical error: TELEGRAM_HASH is not set in the .env file.")
 
 try:
-    with open(CONFIG_PATH, "rb") as f:
-        config_data = tomllib.load(f)
-
-    TELEGRAM_API_ID = int(config_data["telegram_app"]["id"])
-    TELEGRAM_API_HASH = str(config_data["telegram_app"]["hash"])
-
-    # Load ignored users. Automatically convert to lowercase and strip out any accidental '@' symbols.
-    IGNORE_USERS = [str(u).lower().lstrip('@') for u in config_data.get("ignore", {}).get("users", [])]
-
-except FileNotFoundError:
-    raise FileNotFoundError(f"Critical error: Configuration file not found at '{CONFIG_PATH}'. Please verify the path.")
-except KeyError as e:
-    raise KeyError(f"Critical error: Missing expected key {e} inside '{CONFIG_PATH}'. Verify your TOML structure matches.")
+    TELEGRAM_API_ID = int(_telegram_id_raw)
 except ValueError:
-    raise ValueError(f"Critical error: 'id' in '{CONFIG_PATH}' must be a valid integer.")
+    raise ValueError("Critical error: TELEGRAM_ID in .env must be a valid integer.")
+
+TELEGRAM_API_HASH = _telegram_hash_raw
+
+# Load ignored users. Automatically convert to lowercase and strip out any accidental '@' symbols.
+_ignore_raw = os.getenv("IGNORE_USERS", "")
+IGNORE_USERS = [u.strip().lower().lstrip('@') for u in _ignore_raw.split(',') if u.strip()]
+
+DB_PATH = os.getenv("DB_PATH", "db/border-bot-telegram-scraper.db")
 
 # Initialize Supabase Admin Client
 supabase = get_supabase_client()
+
+def init_db():
+    """Create the SQLite database and tables by running the external schema file."""
+    SCHEMA_PATH = os.path.join(os.path.dirname(__file__), '..', 'db_scripts', 'sqlite-schema.sql')
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    with open(SCHEMA_PATH, 'r', encoding='utf-8') as f:
+        schema_sql = f.read()
+    conn = sqlite3.connect(DB_PATH)
+    conn.executescript(schema_sql)
+    conn.close()
+    logger.info(f"SQLite DB initialised at: {DB_PATH}")
 
 def is_valid_message(message, ignore_users):
     """Check if the message has text and is not from an ignored user."""
@@ -96,7 +94,7 @@ async def scrape_active_channels():
         return
 
     # 2. Connect to local SQLite cache database
-    db_conn = sqlite3.connect('db/border-bot-telegram-scraper.db')
+    db_conn = sqlite3.connect(DB_PATH)
     db_cursor = db_conn.cursor()
 
     # 3. Boot up the Telegram client
@@ -195,6 +193,7 @@ async def scrape_active_channels():
     logger.info("★ Cycle complete. System disconnected safely. ★")
 
 if __name__ == "__main__":
+    init_db()
     asyncio.run(scrape_active_channels())
     logger.info("★ Starting LLM Extraction Phase ★")
     process_all_checkpoints()

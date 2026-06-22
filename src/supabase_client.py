@@ -1,18 +1,17 @@
 import os
-import tomllib
 from datetime import datetime, timezone
 from supabase import create_client, Client
 
 def get_supabase_client() -> Client:
     """Initialize and return a Supabase Admin Client."""
-    CONFIG_PATH = os.path.join("config", "scraper_config.toml")
-    
-    with open(CONFIG_PATH, "rb") as f:
-        config_data = tomllib.load(f)
-        
-    SUPABASE_URL = str(config_data["supabase"]["url"])
-    SUPABASE_KEY = str(config_data["supabase"]["key"])
-    
+    SUPABASE_URL = os.getenv("SUPABASE_URL")
+    SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+    if not SUPABASE_URL:
+        raise EnvironmentError("Critical error: SUPABASE_URL is not set in the .env file.")
+    if not SUPABASE_KEY:
+        raise EnvironmentError("Critical error: SUPABASE_KEY is not set in the .env file.")
+
     return create_client(SUPABASE_URL, SUPABASE_KEY)
 
 def get_active_checkpoints(supabase: Client):
