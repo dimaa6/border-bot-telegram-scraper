@@ -3,8 +3,7 @@ scaper.py extracts messages from chats and saves them into local sqlite, llm_ext
 
 Configuration files:
 
-- scraper_config.toml - configuration for scraper.py
-- llm_extractor_config.toml - configuration for llm_extractor.py
+- .env - global configuration
 
 Config matrix file:
 

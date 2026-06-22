@@ -1,0 +1,33 @@
+services:
+  scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        USER_ID: "${HOST_UID:-1000}"
+        GROUP_ID: "${HOST_GID:-1000}"
+    image: border-bot-scraper:latest
+    container_name: border-bot-scraper
+    env_file:
+      - .env
+    volumes:
+      - "${SCRAPER_LOG_DIR:-./logs}:/app/logs"
+      - "${SCRAPER_DB_DIR:-./db}:/app/db"
+      - "${SCRAPER_TG_SESSION:-./bbhelper.session}:/app/bbhelper.session"
+    command: ["sleep", "infinity"]
+
+  scheduler:
+    image: mcuadros/ofelia:latest
+    container_name: border-bot-scheduler
+    depends_on:
+      - scraper
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: daemon --docker
+    restart: unless-stopped
+    labels:
+      ofelia.enabled: "true"
+      ofelia.job-exec.border-scraper-cron.schedule: "0 10 */2 * * *"
+      ofelia.job-exec.border-scraper-cron.container: "border-bot-scraper"
+      ofelia.job-exec.border-scraper-cron.command: "python src/scraper.py"
+      ofelia.job-exec.border-scraper-cron.no-overlap: "true"
