@@ -11,6 +11,7 @@ venv/
 img/
 *.yaml
 *.md
+*.session
 Dockerfile
 db/
 logs/
