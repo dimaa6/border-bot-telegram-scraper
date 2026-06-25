@@ -1,0 +1,67 @@
+{
+  "name": "BorderSentimentExtraction",
+  "schema": {
+    "$defs": {
+        "DirectionalSentiment": {
+        "properties": {
+            "movement_state": {
+            "description": "'standstill' if chat reports a complete dead stop, 'slowdown' if things are dragging/fewer lanes, 'accelerated' if moving fast, 'normal' otherwise.",      
+            "enum": [
+                "normal",
+                "slowdown",
+                "standstill",
+                "accelerated"
+            ],
+            "title": "Movement State",
+            "type": "string"
+            },
+            "reported_crossing_minutes": {
+            "anyOf": [
+                {
+                "type": "integer"
+                },
+                {
+                "type": "null"
+                }
+            ],
+            "default": null,
+            "description": "If a message explicitly states a completed crossing time (e.g., '\u043f\u0440\u043e\u0457\u0445\u0430\u043b\u0438 \u0437\u0430 2 \u0433\u043e\u0434'), extract that total time in minutes.",
+            "title": "Reported Crossing Minutes"
+            },
+            "source_message_id": {
+            "anyOf": [
+                {
+                "type": "integer"
+                },
+                {
+                "type": "null"
+                }
+            ],
+            "default": null,
+            "description": "ID of the message you extracted the reported crossing time from.",
+            "title": "Source Message Id"
+            }
+        },
+        "required": [
+            "movement_state"
+        ],
+        "title": "DirectionalSentiment",
+        "type": "object"
+        }
+    },
+    "properties": {
+        "from_ukraine": {
+        "$ref": "#/$defs/DirectionalSentiment"
+        },
+        "to_ukraine": {
+        "$ref": "#/$defs/DirectionalSentiment"
+        }
+    },
+    "required": [
+        "from_ukraine",
+        "to_ukraine"
+    ],
+    "title": "BorderSentimentExtraction",
+    "type": "object"
+  }
+}
