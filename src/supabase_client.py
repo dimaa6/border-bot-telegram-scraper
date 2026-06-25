@@ -50,6 +50,19 @@ def get_previous_estimates(supabase: Client, checkpoint_id: str) -> tuple:
     prev_inbound  = next((r for r in rows if r["direction"] == "INBOUND"),  None)
     return prev_outbound, prev_inbound
 
+def get_queue_history(supabase: Client, checkpoint_id: str, direction: str, limit: int = 4) -> list:
+    """Fetch the last `limit` cars_queue_size values for a checkpoint and direction, returned oldest to newest."""
+    rows = supabase.table("time_stat") \
+        .select("cars_queue_size") \
+        .eq("checkpoint_id", checkpoint_id) \
+        .eq("direction", direction) \
+        .order("recorded_at", desc=True) \
+        .limit(limit) \
+        .execute().data
+    
+    history = [r["cars_queue_size"] for r in rows if r.get("cars_queue_size") is not None]
+    return list(reversed(history))
+
 def insert_time_stats(supabase: Client, stats: list) -> None:
     """Insert a list of time_stat prediction records into Supabase."""
     supabase.table("time_stat").insert(stats).execute()
