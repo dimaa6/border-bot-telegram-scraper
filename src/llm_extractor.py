@@ -15,6 +15,7 @@ from config_matrix import ConfigMatrix
 from supabase_client import get_supabase_client, get_active_checkpoints, insert_time_stats, get_queue_history
 from nakordoni_multi import fetch_nakordoni_multi_data, NakordoniMultiDataNode
 from filter import extrapolate_trend_proxy
+from transcript_builder import get_chat_transcript, cleanup_old_messages
 
 # Hard minimum crossing times — enforced in code after LLM response, regardless of queue size
 MIN_OUTBOUND_MINUTES = 60  # Leaving Ukraine → Poland: exit control + customs + crossing + Schengen/Polish entry
@@ -83,63 +84,12 @@ def calculate_final_wait_time(base_throughput, capacity, queue_size, sentiment, 
 
 def parse_latest_messages(checkpoint_id: str, llm_provider: str, ai_client, openai_client, claude_client, retry_interval: int, retry_number: int):
     
-    # Extract the chronological sliding window text from your local SQLite cache
-    db_conn = sqlite3.connect(os.getenv("DB_PATH", "db/border-bot-telegram-scraper.db"))
-    cursor = db_conn.cursor()
-
-    # Let's fetch the last 30 raw text messages for the specified channel
-    # Fetch the 30 most recent messages, then sort chronologically in SQL
-    cursor.execute('''
-        SELECT message_id, message_text, recorded_at, reply_to_msg_id
-        FROM (
-            SELECT message_id, message_text, recorded_at, reply_to_msg_id
-            FROM message_log
-            WHERE checkpoint_id = ? AND recorded_at >= datetime('now', '-8 hours')
-            ORDER BY recorded_at DESC
-            LIMIT 40
-        )
-        ORDER BY recorded_at ASC
-    ''', (checkpoint_id,))
+    db_path = os.getenv("DB_PATH", "db/border-bot-telegram-scraper.db")
+    raw_transcript, msg_map, rows_count, latest_msg_dt = get_chat_transcript(checkpoint_id, db_path)
     
-    rows = cursor.fetchall()
-    
-    if not rows:
+    if raw_transcript is None:
         logger.info(f"No messages cached for checkpoint {checkpoint_id}.")
-        db_conn.close()
         return None, None, None, None
-
-    # First pass: map messages by their ID for rapid lookup    
-    msg_map = {row[0]: {"text": row[1].replace('\n', ' '), "time": row[2]} for row in rows}
-    
-    # Second pass: Build a highly structured transcript timeline for the LLM
-    transcript_lines = []
-    now_utc = datetime.now(timezone.utc)
-    for msg_id, text, timestamp, reply_to_msg_id in rows:
-        clean_text = text.replace('\n', ' ')
-        
-        try:
-            msg_dt = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
-            minutes_ago = int((now_utc - msg_dt).total_seconds() / 60)
-            # Ensure we don't say "-1 minutes ago" if there's a slight time sync issue
-            minutes_ago = max(0, minutes_ago)
-            time_label = f"{minutes_ago} minutes ago"
-        except Exception:
-            time_label = timestamp
-            
-        # Reconstruct structural context if the message is an active reply
-        if reply_to_msg_id and reply_to_msg_id in msg_map:
-            parent_preview = msg_map[reply_to_msg_id]["text"]
-            # Truncate parent text preview to keep prompt compact but readable
-            if len(parent_preview) > 60:
-                parent_preview = parent_preview[:57] + "..."
-            
-            context_string = f"[{time_label}] ID-{msg_id} (REPLY TO ID-{reply_to_msg_id} -> '{parent_preview}'): {clean_text}"
-        else:
-            context_string = f"[{time_label}] ID-{msg_id}: {clean_text}"
-            
-        transcript_lines.append(context_string)
-    
-    raw_transcript = "\n".join(transcript_lines)
 
     # 5. Build a deterministic analytical prompt
     system_instruction = """You are a qualitative data extraction engine for a border checkpoint. Your sole task is to analyze raw chat logs and extract traffic sentiment and direct user reports into the provided JSON schema.
@@ -147,7 +97,7 @@ def parse_latest_messages(checkpoint_id: str, llm_provider: str, ai_client, open
 INPUT STRING STRUCTURE:
 Each line you analyze follows one of these two exact formats:
 1. `[X minutes ago] ID-12345: Message text...` (Standalone message)
-2. `[X minutes ago] ID-12345 (REPLY TO ID-67890 -> 'Parent message preview text...'): Message text...` (Threaded reply)
+2. `[X minutes ago] ID-12345 (REPLY TO ID-67890): Message text...` (Threaded reply)
 
 CLASSIFICATION RULES:
 1. movement_state:
@@ -185,11 +135,10 @@ CRITICAL DIRECTIONAL OVERRIDE RULES (PASSENGER CARS ONLY):
    - Key tokens: "до Польщі", "в Польщу", "в сторону Польщі", "на виїзд", "на ПЛ", "на виїзд з UA".
 
 3. STRICT THREAD LINKAGE & CONTEXT INHERITANCE:
-   - If a line is a threaded reply containing `(REPLY TO ID-XXXX -> 'Parent text...')`:
-     * You MUST look at the text inside the single quotes `'...'` representing the parent preview.
-     * If that parent text contains an explicit direction (e.g., "до України"), the reply inherits that exact direction, unless the reply explicitly states a different direction token.
-   - For example, if the line is: `ID-285929 (REPLY TO ID-285926 -> 'Підкажіть яка черга до України...'): 3 авто по зеленому` -> The "3 авто" belongs STRICTLY to 'to_ukraine' because of the parent preview text. Mapping it to outbound is a critical logical failure.
-   - If a line has NO explicit direction tokens AND has no `REPLY TO ID-` metadata block, you are strictly FORBIDDEN from guessing. Leave both directions as null.
+   - If a line is a threaded reply containing `(REPLY TO ID-XXXX)`:
+     * You MUST look at the preceding lines in the transcript to find the message that matches `ID-XXXX`.
+     * Inherit the directional context strictly from that parent message. If the parent message asked "Яка черга до України?", then this reply is strictly linked to 'to_ukraine'.
+   - If a line has NO explicit direction tokens AND has no `(REPLY TO ID-XXXX)` metadata block, you are strictly FORBIDDEN from guessing. Leave both directions as null.
 
 4. THE BOUNDARY WALL (WHEN TO WRITE NULL):
    - If the text or inherited parent context contains "України" or "Україна" preceded by "в", "до", or "в сторону", it is mathematically IMPOSSIBLE for it to be outbound. You are strictly forbidden from placing this data in 'from_ukraine'.
@@ -245,7 +194,7 @@ ABSOLUTE NUMERICAL FILTERING:
 
     prompt = f"CHAT TRANSCRIPT LOGS:\n{raw_transcript}"
 
-    logger.info(f"Sending {len(rows)} transcript lines for checkpoint {checkpoint_id} to {llm_provider}...")
+    logger.info(f"Sending {rows_count} transcript lines for checkpoint {checkpoint_id} to {llm_provider}...")
     
     current_wait = retry_interval
     for attempt in range(retry_number + 1):
@@ -380,20 +329,9 @@ ABSOLUTE NUMERICAL FILTERING:
             f"Raw response text (first 1000 chars):\n{raw_text[:1000] if raw_text else '<empty>'}"
         )
 
-    # Clean up messages older than 24 hours using the existing open connection
-    cutoff_time = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime('%Y-%m-%d %H:%M:%S')
-    try:
-        cursor.execute(
-            "DELETE FROM message_log WHERE checkpoint_id = ? AND recorded_at < ?",
-            (checkpoint_id, cutoff_time)
-        )
-        db_conn.commit()
-    except Exception as e:
-        logger.error(f"❌ Error during local DB cleanup for {checkpoint_id}: {e}", exc_info=True)
-    finally:
-        db_conn.close()
+    # Clean up messages older than 24 hours
+    cleanup_old_messages(checkpoint_id, db_path)
 
-    latest_msg_dt = datetime.strptime(rows[-1][2], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc) if rows else None
     return extracted_data, "LLM", msg_map, latest_msg_dt
 
 def _build_metadata(nakordoni_cp: Optional[NakordoniMultiDataNode], is_jammed: bool, is_warning: bool, prediction_source: str, llm_data: Optional[DirectionalSentiment] = None) -> dict:
