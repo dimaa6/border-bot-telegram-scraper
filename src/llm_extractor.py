@@ -13,7 +13,7 @@ import anthropic
 from log_setup import configure_logging
 from config_matrix import ConfigMatrix
 from supabase_client import get_supabase_client, get_active_checkpoints, insert_time_stats, get_queue_history
-from nakordoni_multi import fetch_nakordoni_multi_data, NakordoniMultiDataNode
+from nakordoni_client import fetch_nakordoni_data, NakordoniCheckpoint
 from filter import extrapolate_trend_proxy
 from transcript_builder import get_chat_transcript, cleanup_old_messages
 
@@ -334,7 +334,7 @@ ABSOLUTE NUMERICAL FILTERING:
 
     return extracted_data, "LLM", msg_map, latest_msg_dt
 
-def _build_metadata(nakordoni_cp: Optional[NakordoniMultiDataNode], is_jammed: bool, is_warning: bool, prediction_source: str, llm_data: Optional[DirectionalSentiment] = None) -> dict:
+def _build_metadata(nakordoni_cp: Optional[NakordoniCheckpoint], is_jammed: bool, is_warning: bool, prediction_source: str, llm_data: Optional[DirectionalSentiment] = None) -> dict:
     """Build the metadata JSONB payload stored alongside each time_stat record.
 
     Captures:
@@ -343,17 +343,16 @@ def _build_metadata(nakordoni_cp: Optional[NakordoniMultiDataNode], is_jammed: b
     - prediction_source: the source of the prediction (e.g. 'LLM' or 'MATH')
     """
     nakordoni_snapshot = {}
-    if nakordoni_cp and nakordoni_cp.queue:
-        updated_at = None
-        if nakordoni_cp.update_info and nakordoni_cp.update_info.timestamp:
-            dt = datetime.fromtimestamp(nakordoni_cp.update_info.timestamp, timezone.utc)
-            updated_at = dt.isoformat()
+    if nakordoni_cp and nakordoni_cp.queue is not None:
+        updated_at = nakordoni_cp.updated_at
+        if not updated_at:
+            updated_at = datetime.now(timezone.utc).isoformat()
             
         nakordoni_snapshot = {
-            "queue":          nakordoni_cp.queue.queue_now,
-            "wait_min":       nakordoni_cp.queue.wait_min,
-            "tpercar":        nakordoni_cp.queue.tpercar,
-            "traffic_status": None,
+            "queue":          nakordoni_cp.queue,
+            "wait_min":       nakordoni_cp.wait_min,
+            "tpercar":        None,
+            "traffic_status": nakordoni_cp.traffic_status,
             "updated_at":     updated_at,
         }
 
@@ -405,29 +404,9 @@ def process_all_checkpoints():
     supabase = get_supabase_client()
     checkpoints = get_active_checkpoints(supabase)
 
-    chunk_size = 10
-    nakordoni_all_data = {}
-    
-    for chunk_start in range(0, len(checkpoints), chunk_size):
-        chunk_checkpoints = checkpoints[chunk_start:chunk_start + chunk_size]
-        
-        ppids_to_fetch = []
-        for cp in chunk_checkpoints:
-            raw_matrix = cp.get("config_matrix") or {}
-            config_matrix = ConfigMatrix(**raw_matrix)
-            if config_matrix.nakordoni and config_matrix.nakordoni.car:
-                if config_matrix.nakordoni.car.inbound_id:
-                    ppids_to_fetch.append(config_matrix.nakordoni.car.inbound_id)
-                if config_matrix.nakordoni.car.outbound_id:
-                    ppids_to_fetch.append(config_matrix.nakordoni.car.outbound_id)
-                    
-        ppids_to_fetch = list(set(ppids_to_fetch))
-        
-        if ppids_to_fetch:
-            logger.info(f"Fetching official queue data from Nakordoni for {len(ppids_to_fetch)} ppids...")
-            chunk_data = fetch_nakordoni_multi_data(ppids_to_fetch)
-            nakordoni_all_data.update(chunk_data)
-            logger.info(f"Fetched data for {len(chunk_data)} checkpoints from Nakordoni.")
+    logger.info("Fetching official queue data from Nakordoni for all checkpoints...")
+    nakordoni_all_data = fetch_nakordoni_data()
+    logger.info(f"Fetched data for {len(nakordoni_all_data)} checkpoints from Nakordoni.")
 
     for j, cp in enumerate(checkpoints):
         checkpoint_id = cp["checkpoint_id"]
@@ -502,7 +481,7 @@ def process_all_checkpoints():
                 queue_size = sentiment_data.reported_queue_length
 
                 if queue_size is None:
-                    queue_size = nakordoni_data.queue.queue_now if nakordoni_data and nakordoni_data.queue and nakordoni_data.queue.queue_now is not None else 0
+                    queue_size = nakordoni_data.queue if nakordoni_data and nakordoni_data.queue is not None else 0
 
                 if queue_size == 0:
                     history = get_queue_history(supabase, checkpoint_id, direction_name, limit=4)
@@ -548,12 +527,19 @@ def process_all_checkpoints():
                     fallback_times = []
                     if latest_msg_dt:
                         fallback_times.append(latest_msg_dt)
-                    if nakordoni_data and nakordoni_data.update_info and nakordoni_data.update_info.timestamp:
-                        try:
-                            dt = datetime.fromtimestamp(nakordoni_data.update_info.timestamp, timezone.utc)
-                            fallback_times.append(dt)
-                        except Exception as e:
-                            logger.warning(f"Failed to parse nakordoni timestamp: {nakordoni_data.update_info.timestamp}. Error: {e}")
+                    if nakordoni_data:
+                        if nakordoni_data.updated_at:
+                            try:
+                                if 'T' in nakordoni_data.updated_at:
+                                    dt = datetime.fromisoformat(nakordoni_data.updated_at.replace('Z', '+00:00'))
+                                else:
+                                    dt = datetime.strptime(nakordoni_data.updated_at, '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                                fallback_times.append(dt)
+                            except Exception as e:
+                                logger.warning(f"Failed to parse nakordoni timestamp: {nakordoni_data.updated_at}. Error: {e}")
+                                fallback_times.append(datetime.now(timezone.utc))
+                        else:
+                            fallback_times.append(datetime.now(timezone.utc))
                     if fallback_times:
                         extracted_at = max(fallback_times)
     
