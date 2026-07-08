@@ -1,58 +1,68 @@
 import os
-import sqlite3
 from dotenv import load_dotenv
 import time
 import random
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Literal
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types
 import openai
 import anthropic
+from typing import Literal, Any
 from log_setup import configure_logging
 from config_matrix import ConfigMatrix
 from supabase_client import get_supabase_client, get_active_checkpoints, insert_time_stats, get_queue_history
 from nakordoni_client import fetch_nakordoni_data, NakordoniCheckpoint
 from filter import extrapolate_trend_proxy
 from transcript_builder import get_chat_transcript, cleanup_old_messages
+from llm_prompt import build_prompt
 
 # Hard minimum crossing times — enforced in code after LLM response, regardless of queue size
 MIN_OUTBOUND_MINUTES = 60  # Leaving Ukraine → Poland: exit control + customs + crossing + Schengen/Polish entry
 MIN_INBOUND_MINUTES  = 20  # Entering Ukraine ← Poland: Polish exit + crossing + Ukrainian entry control
 
+# --- CONFIGURATION LOADING FROM .env ---
+load_dotenv()
+
 # --- LOGGING SETUP ---
 logger = configure_logging("llm_extractor.log")
 
-class DirectionalSentiment(BaseModel):
-    # Classification of overall chat traffic movement
-    movement_state: Literal["normal", "slowdown", "standstill", "accelerated"] = Field(
-        description="'standstill' if chat reports a complete dead stop, 'slowdown' if things are dragging/fewer lanes, 'accelerated' if moving fast, 'normal' otherwise."
-    )
-    # Target explicit crossing times mentioned in the chat
-    reported_crossing_minutes: Optional[int] = Field(
+class QueueReport(BaseModel):
+    value: int | None = Field(
         default=None,
-        description="If a message explicitly states a completed crossing time (e.g., 'проїхали за 2 год'), extract that total time in minutes."
+        description="Reported pre-barrier queue length as a best integer estimate. Null if only a landmark reference was given, with no explicit count."
     )
-    # Target explicit queue length mentioned in the chat
-    reported_queue_length: Optional[int] = Field(
-        default=None,
-        description="If a message explicitly states a queue length (e.g., '25 машин'), extract that length."
+    source_message_id: int
+    is_approximate: bool = Field(
+        default=False,
+        description="True if the message expressed this as a rough/uncertain estimate ('+~20', 'коло 20', 'приблизно', 'не бачу точно') rather than a precise stated count."
     )
-    # Source message id of the reported crossing time
-    time_source_message_id: Optional[int] = Field(
+    landmark_mentioned: str | None = Field(
         default=None,
-        description="ID of the message you extracted the reported crossing time from."
-    )
-    # Source message id of the reported queue length
-    queue_source_message_id: Optional[int] = Field(
-        default=None,
-        description="ID of the message you extracted the reported queue length from."
+        description="If the message references a named landmark from this checkpoint's list to describe queue extent, copy the normalized label here — REGARDLESS of whether an explicit count is also given in the same message."
     )
 
+class TimeReport(BaseModel):
+    value: int = Field(
+        description="Completed total crossing time in minutes (e.g., '2 години' -> 120, '1.5 год' -> 90). Only for FULLY completed crossings, never partial segments."
+    )
+    source_message_id: int
+
+class DirectionalSentiment(BaseModel):
+    movement_state: Literal["normal", "slowdown", "standstill", "accelerated"] = Field(
+        description=(
+            "'standstill': at least TWO independent messages report a complete dead stop / no movement for an extended period. "
+            "'slowdown': a single no-movement report, OR general complaints of slow processing, long waits, closed lanes, low throughput rate. "
+            "'accelerated': extra lanes opening or traffic explicitly clearing/moving fast. "
+            "'normal': default when quiet, routine, or steady movement is reported."
+        )
+    )
+    reported_crossing_minutes: list[TimeReport] = Field(default_factory=list)
+    reported_queue_lengths: list[QueueReport] = Field(default_factory=list)
+
 class BorderSentimentExtraction(BaseModel):
-    from_ukraine: DirectionalSentiment
-    to_ukraine: DirectionalSentiment
+    from_ukraine: DirectionalSentiment = Field(description="Traffic leaving Ukraine, heading to Poland")
+    to_ukraine: DirectionalSentiment = Field(description="Traffic entering Ukraine from Poland")
 
 def calculate_final_wait_time(base_throughput, capacity, queue_size, sentiment, floor_limit):
     # 1. Calculate the standard baseline minutes
@@ -76,125 +86,30 @@ def calculate_final_wait_time(base_throughput, capacity, queue_size, sentiment, 
         final_minutes = int(final_minutes * 0.75)
 
     # 3. Handle crossing overrides if available
-    if sentiment.reported_crossing_minutes is not None:
-        final_minutes = sentiment.reported_crossing_minutes
+    if sentiment.reported_crossing_minutes:
+        latest_time_report = max(sentiment.reported_crossing_minutes, key=lambda x: x.source_message_id)
+        final_minutes = latest_time_report.value
 
     # 4. Enforce floors
     return max(final_minutes, floor_limit)
 
-def parse_latest_messages(checkpoint_id: str, llm_provider: str, ai_client, openai_client, claude_client, retry_interval: int, retry_number: int):
-    
+def parse_latest_messages(checkpoint: dict[str, Any], llm_provider: str, ai_client, openai_client, claude_client, retry_interval: int, retry_number: int):
     db_path = os.getenv("DB_PATH", "db/border-bot-telegram-scraper.db")
-    raw_transcript, msg_map, rows_count, latest_msg_dt = get_chat_transcript(checkpoint_id, db_path)
-    
+    checkpoint_id = checkpoint["checkpoint_id"]
+    raw_transcript, msg_map, rows_count, latest_msg_dt = get_chat_transcript(checkpoint_id, db_path, checkpoint["lookback_hours"])
+
     if raw_transcript is None:
         logger.info(f"No messages cached for checkpoint {checkpoint_id}.")
         return None, None, None, None
 
-    # 5. Build a deterministic analytical prompt
-    system_instruction = """You are a qualitative data extraction engine for a border checkpoint. Your sole task is to analyze raw chat logs and extract traffic sentiment and direct user reports into the provided JSON schema.
-
-INPUT STRING STRUCTURE:
-Each line you analyze follows one of these two exact formats:
-1. `[X minutes ago] ID-12345: Message text...` (Standalone message)
-2. `[X minutes ago] ID-12345 (REPLY TO ID-67890): Message text...` (Threaded reply)
-
-CLASSIFICATION RULES:
-1. movement_state:
-- "standstill": Chat reports a dead stop, complete block, or no movement for over 30 minutes.
-- "slowdown": Chat complains about exceptionally slow processing, long terminal waits, or closed lanes.
-- "accelerated": Chat explicitly mentions extra lanes opening or traffic clearing out rapidly.
-- "normal": Default state when chat is quiet, routine, or reports steady movement.
-
-2. reported_crossing_minutes:
-- Look at the age prefix (e.g., `[45 minutes ago]`). If it is `[180 minutes ago]` or higher, you MUST ignore the line when extracting crossing times.
-- If a valid message under 180 minutes reports a completed transit experience, convert the stated time directly into total minutes (e.g., "1.5 год" = 90, "3 години" = 180).
-
-3. reported_queue_length:
-- Look at the age prefix. If it is `[180 minutes ago]` or higher, you MUST ignore the line when extracting queue lengths.
-- If a valid message explicitly states a queue length (e.g., '25 машин', '3 авто'), extract that integer.
-- If a message says "відразу на територію", "відразу на кордон", "пусто", or "немає черги", the queue length is 0.
-
-4. time_source_message_id & queue_source_message_id:
-- You MUST populate these fields with the exact numeric digits following the `ID-` tag of the primary line (not the reply-to ID). For example, in `ID-285929`, the ID is 285929. If no data is extracted, leave as null.
-
-CRITICAL TRANSCRIPT FILTERING RULES:
-- Ignore all questions, requests for updates, and info-seeking messages (e.g., messages containing "Підкажіть", "яка черга?", "чи є рух?", "хто знає"). They do NOT represent real conditions.
-- Only extract state classifications from factual assertions or direct driver updates (e.g., "пусто", "стоїмо", "проїхали за...").
-
-FOREIGN CHECKPOINT FIREWALL:
-- Drivers frequently reference entirely different borders in chat threads. If the main message text or the parent message preview explicitly mentions a different checkpoint by name (e.g., "Угринів", "Uhryniv", "Ягодин", "Краківець", "Рава", "Грушів", "Шегині"), you MUST completely ignore that line. NEVER extract queue sizes, wait times, or sentiment from lines mentioning a foreign checkpoint.
-
-CRITICAL DIRECTIONAL OVERRIDE RULES (PASSENGER CARS ONLY):
-1. 'to_ukraine' (Entering Ukraine, Inbound) STRICT DEFINITION:
-   - A message belongs to this direction ONLY if it contains phrases explicitly showing movement TOWARDS Ukraine.
-   - Key tokens: "в Україну", "до України", "в сторону України", "на в'їзд", "додому", "на UA".
-
-2. 'from_ukraine' (Leaving Ukraine / Going abroad, Outbound) STRICT DEFINITION:
-   - A message belongs to this direction ONLY if it contains phrases showing movement AWAY from Ukraine / TOWARDS Poland.
-   - Key tokens: "до Польщі", "в Польщу", "в сторону Польщі", "на виїзд", "на ПЛ", "на виїзд з UA".
-
-3. STRICT THREAD LINKAGE & CONTEXT INHERITANCE:
-   - If a line is a threaded reply containing `(REPLY TO ID-XXXX)`:
-     * You MUST look at the preceding lines in the transcript to find the message that matches `ID-XXXX`.
-     * Inherit the directional context strictly from that parent message. If the parent message asked "Яка черга до України?", then this reply is strictly linked to 'to_ukraine'.
-   - If a line has NO explicit direction tokens AND has no `(REPLY TO ID-XXXX)` metadata block, you are strictly FORBIDDEN from guessing. Leave both directions as null.
-
-4. THE BOUNDARY WALL (WHEN TO WRITE NULL):
-   - If the text or inherited parent context contains "України" or "Україна" preceded by "в", "до", or "в сторону", it is mathematically IMPOSSIBLE for it to be outbound. You are strictly forbidden from placing this data in 'from_ukraine'.
-   - If there is even a 1% ambiguity or lack of clear directional tokens in both the text and the parent string block, output null for all fields. Never assume.
-
-ABSOLUTE NUMERICAL FILTERING:
-- NEVER extract numbers or sentiment from questions, emotional outcries, or messages mocking/repeating a previous statement (e.g., "Яких 0?", "Звідки там 5 годин?!"). 
-- Only extract queue sizes if they are part of a direct, affirmative factual update from a driver.
-"""
-
-# """FEW-SHOT TRAINING EXAMPLES FOR COLD START ALIGNMENT:
-
-# EXAMPLE 1 ANALYSIS TASK:
-# Transcript:
-# [2026-06-25 10:53] ID-101: А в Україну є черга?
-# [2026-06-25 10:56] ID-102: Додому пусто
-# [2026-06-25 11:32] ID-103: Вітаю! Підкажіть будь ласка, на цей момент в Україну яка черга?
-# Target Output JSON Representation:
-# {
-#   "from_ukraine": { "movement_state": "normal", "reported_crossing_minutes": null },
-#   "to_ukraine": { "movement_state": "normal", "reported_crossing_minutes": null }
-# }
-
-# EXAMPLE 2 ANALYSIS TASK:
-# Transcript:
-# [2026-06-25 12:10] ID-201: Черга жах, стоїмо на одному місці вже годину, жодна машина не проїхала
-# [2026-06-25 12:15] ID-202: До Польщі повний стоп, митники не працюють взагалі
-# Target Output JSON Representation:
-# {
-#   "from_ukraine": { "movement_state": "standstill", "reported_crossing_minutes": null },
-#   "to_ukraine": { "movement_state": "normal", "reported_crossing_minutes": null }
-# }
-
-# EXAMPLE 3 ANALYSIS TASK:
-# Transcript:
-# [2026-06-25 14:05] ID-301: Привіт усім. Проїхали до Польщі щойно. Загалом все зайняло десь 2.5 години від сили. Рух є.
-# [2026-06-25 14:12] ID-302: Хто знає як автобуси йдуть на вїзд?
-# Target Output JSON Representation:
-# {
-#   "from_ukraine": { "movement_state": "normal", "reported_crossing_minutes": 150 },
-#   "to_ukraine": { "movement_state": "normal", "reported_crossing_minutes": null }
-# }
-
-# EXAMPLE 4 ANALYSIS TASK:
-# Transcript:
-# [2026-06-25 15:20] ID-401: На території капець, оформляють дуже повільно, працює всього один пас. Навіть перед шлагбаумом черга росте.
-# Target Output JSON Representation:
-# {
-#   "from_ukraine": { "movement_state": "slowdown", "reported_crossing_minutes": null },
-#   "to_ukraine": { "movement_state": "normal", "reported_crossing_minutes": null }
-# }
-# """
-
     prompt = f"CHAT TRANSCRIPT LOGS:\n{raw_transcript}"
 
+    system_instruction, checkpoint_block = build_prompt(checkpoint)
+
     logger.info(f"Sending {rows_count} transcript lines for checkpoint {checkpoint_id} to {llm_provider}...")
+    logger.debug("--- TRANSCRIPT START ---")
+    logger.debug(f"\n{raw_transcript}")
+    logger.debug("--- TRANSCRIPT END ---")
     
     current_wait = retry_interval
     for attempt in range(retry_number + 1):
@@ -220,6 +135,7 @@ ABSOLUTE NUMERICAL FILTERING:
             elif llm_provider == "GPT":
                 messages = [
                     {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": checkpoint_block},
                     {"role": "user", "content": prompt}
                 ]
                 response = openai_client.beta.chat.completions.parse(
@@ -251,7 +167,10 @@ ABSOLUTE NUMERICAL FILTERING:
                     messages=[
                         {
                             "role": "user",
-                            "content": prompt
+                            "content": [
+                                {"type": "text", "text": checkpoint_block, "cache_control": {"type": "ephemeral"}},
+                                {"type": "text", "text": prompt}
+                            ]
                         }
                     ]
                 )
@@ -319,7 +238,9 @@ ABSOLUTE NUMERICAL FILTERING:
     logger.info(f"Thinking Tokens (internal CoT):      {thinking_tokens}")
     logger.info(f"Output Tokens (Model's JSON):        {completion_tokens}")
     logger.info(f"Total Session Tokens Consumed:       {total_tokens}")
-    logger.info("----------------------------------------")
+    logger.debug("----------------------------------------")
+    logger.debug(f"RAW LLM RESPONSE:\n{raw_text}")
+    logger.debug("----------------------------------------")
 
     # The SDK automatically handles verification and transforms the raw JSON response
     # right back into a concrete object matching your Pydantic schema structure!
@@ -334,7 +255,7 @@ ABSOLUTE NUMERICAL FILTERING:
 
     return extracted_data, "LLM", msg_map, latest_msg_dt
 
-def _build_metadata(nakordoni_cp: Optional[NakordoniCheckpoint], is_jammed: bool, is_warning: bool, prediction_source: str, llm_data: Optional[DirectionalSentiment] = None) -> dict:
+def _build_metadata(nakordoni_cp: NakordoniCheckpoint | None, is_jammed: bool, is_warning: bool, prediction_source: str, llm_data: DirectionalSentiment | None = None, extracted_queue_size: int | None = None) -> dict:
     """Build the metadata JSONB payload stored alongside each time_stat record.
 
     Captures:
@@ -356,13 +277,13 @@ def _build_metadata(nakordoni_cp: Optional[NakordoniCheckpoint], is_jammed: bool
             "updated_at":     updated_at,
         }
 
-        llm_snapshot = {
-            "is_jammed":  is_jammed,
-            "is_warning": is_warning
-        }
-        if llm_data:
-            llm_snapshot["state"] = llm_data.movement_state or "unknown"
-            llm_snapshot["queue"] = llm_data.reported_queue_length or "unknown"
+    llm_snapshot = {
+        "is_jammed":  is_jammed,
+        "is_warning": is_warning
+    }
+    if llm_data:
+        llm_snapshot["state"] = llm_data.movement_state or "unknown"
+        llm_snapshot["queue"] = extracted_queue_size if extracted_queue_size is not None else "unknown"
 
     return {
         "nakordoni": nakordoni_snapshot,
@@ -412,7 +333,7 @@ def process_all_checkpoints():
         checkpoint_id = cp["checkpoint_id"]
 
         raw_matrix = cp.get("config_matrix") or {}
-        config_matrix = ConfigMatrix(**raw_matrix)
+        config_matrix = ConfigMatrix.model_validate(raw_matrix)
 
         matched_nakordoni = {
             "INBOUND": None,
@@ -425,7 +346,7 @@ def process_all_checkpoints():
                 matched_nakordoni["OUTBOUND"] = nakordoni_all_data.get(config_matrix.nakordoni.car.outbound_id)
 
         logger.info(f"Processing checkpoint: {checkpoint_id}")
-        metrics, prediction_source, msg_map, latest_msg_dt = parse_latest_messages(checkpoint_id, llm_provider, ai_client, openai_client, claude_client, retry_interval, retry_number)
+        metrics, prediction_source, msg_map, latest_msg_dt = parse_latest_messages(cp, llm_provider, ai_client, openai_client, claude_client, retry_interval, retry_number)
     
         if metrics:
             logger.info(f"★ SUCCESS! Type-Safe Metrics Extracted by {prediction_source} for {checkpoint_id} ★")
@@ -473,22 +394,74 @@ def process_all_checkpoints():
                 comment_prefix,
                 log_header,
                 msg_map,
-                latest_msg_dt
+                latest_msg_dt,
+                landmark_rules,
+                segment_mode
             ):
                 if not sentiment_data:
                     return None
 
-                queue_size = sentiment_data.reported_queue_length
+                latest_queue_report = None
+                queue_size = None
+                
+                valid_queue_reports = [r for r in sentiment_data.reported_queue_lengths if r.value is not None or r.landmark_mentioned is not None]
+
+                if valid_queue_reports:
+                    if segment_mode == "segmented":
+                        latest_msg_id = max(r.source_message_id for r in valid_queue_reports)
+                        latest_reports = [r for r in valid_queue_reports if r.source_message_id == latest_msg_id]
+                        
+                        total_queue = 0
+                        has_value = False
+                        for r in latest_reports:
+                            if r.value is not None:
+                                total_queue += r.value
+                                has_value = True
+                        
+                        latest_queue_report = latest_reports[0]
+                        if has_value:
+                            queue_size = total_queue
+                    else:
+                        exact_reports = [r for r in valid_queue_reports if not r.is_approximate]
+                        if exact_reports:
+                            latest_queue_report = max(exact_reports, key=lambda x: x.source_message_id)
+                        else:
+                            latest_queue_report = max(valid_queue_reports, key=lambda x: x.source_message_id)
+                        
+                        queue_size = latest_queue_report.value if latest_queue_report else None
+
+                latest_time_report = None
+                if sentiment_data.reported_crossing_minutes:
+                    latest_time_report = max(sentiment_data.reported_crossing_minutes, key=lambda x: x.source_message_id)
+
+                if latest_queue_report and latest_queue_report.landmark_mentioned and landmark_rules:
+                    rules_dict = None
+                    if direction_name == "INBOUND":
+                        rules_dict = landmark_rules.inbound
+                    elif direction_name == "OUTBOUND":
+                        rules_dict = landmark_rules.outbound
+                    
+                    if rules_dict:
+                        normalized_landmark = latest_queue_report.landmark_mentioned.lower()
+                        if normalized_landmark in rules_dict:
+                            landmark_queue_val = rules_dict[normalized_landmark]
+                            
+                            if queue_size is None:
+                                queue_size = landmark_queue_val
+                                logger.info(f"Resolved landmark '{normalized_landmark}' to queue size {queue_size} for {direction_name}.")
+                            elif segment_mode != "segmented":
+                                queue_size += landmark_queue_val
+                                logger.info(f"Added landmark '{normalized_landmark}' ({landmark_queue_val}) to explicit queue size. New total: {queue_size} for {direction_name}.")
 
                 if queue_size is None:
                     queue_size = nakordoni_data.queue if nakordoni_data and nakordoni_data.queue is not None else 0
 
-                if queue_size == 0:
-                    history = get_queue_history(supabase, checkpoint_id, direction_name, limit=4)
-                    if history and history[-1] >= 30:
-                        extrapolated = extrapolate_trend_proxy(history, anomaly_value=0)
-                        logger.info(f"Queue size is 0 but previous was {history[-1]}. Extrapolated to {extrapolated}.")
-                        queue_size = extrapolated
+                # if queue_size == 0:
+                #     history = get_queue_history(supabase, checkpoint_id, direction_name, limit=4)
+                #     if history and history[-1] >= 30:
+                #         extrapolated = extrapolate_trend_proxy(history, anomaly_value=0)
+                #         logger.info(f"Queue size is 0 but previous was {history[-1]}. Extrapolated to {extrapolated}.")
+                #         queue_size = extrapolated
 
                 if direction_name == "INBOUND" and queue_size < 3:
                     throughput *= 2
@@ -507,19 +480,25 @@ def process_all_checkpoints():
                 is_jammed = duration > jammed_threshold
                 is_warning = duration > warning_threshold
     
+                time_val = latest_time_report.value if latest_time_report else None
+                time_src = latest_time_report.source_message_id if latest_time_report else None
+                queue_val = queue_size if queue_size is not None else (latest_queue_report.value if latest_queue_report else None)
+                queue_src = latest_queue_report.source_message_id if latest_queue_report else None
+
                 logger.info(log_header)
                 logger.info(f"Cars Queue Size:   {queue_size}")
                 logger.info(f"Extracted Sentiment: {sentiment_data.movement_state}")
-                logger.info(f"Extracted Time:    {sentiment_data.reported_crossing_minutes}, source message: {sentiment_data.time_source_message_id}")
-                logger.info(f"Extracted Queue:   {sentiment_data.reported_queue_length}, source message: {sentiment_data.queue_source_message_id}")
+                logger.info(f"Extracted Time:    {time_val}, source message: {time_src}")
+                logger.info(f"Extracted Queue:   {queue_val}, source message: {queue_src}")
                 logger.info(f"Calculated Delay:  {duration} min")
                 logger.info(f"Throughput:        {throughput}")
                 logger.info(f"Capacity:          {territory_capacity}")
                 logger.info(f"Insight:           {comment}")
     
                 extracted_at = None
-                if sentiment_data and sentiment_data.time_source_message_id:
-                    msg_info = msg_map.get(sentiment_data.time_source_message_id)
+                source_msg_id = time_src or queue_src
+                if source_msg_id:
+                    msg_info = msg_map.get(source_msg_id)
                     if msg_info:
                         extracted_at = datetime.strptime(msg_info["time"], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
     
@@ -556,7 +535,8 @@ def process_all_checkpoints():
                         is_jammed,
                         is_warning,
                         prediction_source,
-                        sentiment_data
+                        sentiment_data,
+                        queue_size
                     ),
                 }
     
@@ -573,7 +553,9 @@ def process_all_checkpoints():
                 comment_prefix=f"На виїзд до {country_name}",
                 log_header="--- FROM UKRAINE (OUTBOUND) ---",
                 msg_map=msg_map,
-                latest_msg_dt=latest_msg_dt
+                latest_msg_dt=latest_msg_dt,
+                landmark_rules=config_matrix.ai_heuristics.landmark_rules if config_matrix.ai_heuristics else None,
+                segment_mode=config_matrix.ai_heuristics.segment_mode if config_matrix.ai_heuristics else None
             )
             if outbound_stat:
                 stats_to_insert.append(outbound_stat)
@@ -591,7 +573,9 @@ def process_all_checkpoints():
                 comment_prefix="На в'їзд до України",
                 log_header="--- TO UKRAINE (INBOUND) ---",
                 msg_map=msg_map,
-                latest_msg_dt=latest_msg_dt
+                latest_msg_dt=latest_msg_dt,
+                landmark_rules=config_matrix.ai_heuristics.landmark_rules if config_matrix.ai_heuristics else None,
+                segment_mode=config_matrix.ai_heuristics.segment_mode if config_matrix.ai_heuristics else None
             )
             if inbound_stat:
                 stats_to_insert.append(inbound_stat)
@@ -605,7 +589,7 @@ def process_all_checkpoints():
     
         is_last = j == (len(checkpoints) - 1)
         if not is_last:
-            sleep_secs = random.uniform(45, 75)
+            sleep_secs = random.uniform(45, 75) / 2.0
             logger.info(f"Sleeping {sleep_secs:.1f}s before next checkpoint (jittered, to respect API RPM limits)...")
             time.sleep(sleep_secs)
 
