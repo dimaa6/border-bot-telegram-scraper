@@ -8,11 +8,11 @@ from log_setup import configure_logging
 from supabase_client import get_supabase_client, get_active_checkpoints, update_supabase_state
 from llm_extractor import process_all_checkpoints
 
-# --- LOGGING SETUP ---
-logger = configure_logging("scraper.log")
-
 # --- CONFIGURATION LOADING FROM .env ---
 load_dotenv()
+
+# --- LOGGING SETUP ---
+logger = configure_logging("scraper.log")
 
 _telegram_id_raw = os.getenv("TELEGRAM_ID")
 _telegram_hash_raw = os.getenv("TELEGRAM_HASH")

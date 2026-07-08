@@ -59,7 +59,7 @@ def fetch_nakordoni_data() -> Dict[str, NakordoniCheckpoint]:
         with urllib.request.urlopen(req) as response:
             response_body = response.read().decode('utf-8')
             data = json.loads(response_body)
-            parsed_response = NakordoniResponse(**data)
+            parsed_response = NakordoniResponse.model_validate(data)
             
             if not parsed_response.ok or not parsed_response.data.ok:
                 logger.error("Nakordoni API returned ok=false")

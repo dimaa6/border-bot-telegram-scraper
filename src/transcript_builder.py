@@ -5,7 +5,7 @@ from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger(__name__)
 
-def get_chat_transcript(checkpoint_id: str, db_path: str):
+def get_chat_transcript(checkpoint_id: str, db_path: str, lookback_hours: int = 8):
     """
     Fetches the latest messages for a checkpoint, builds a structured thread-grouped
     transcript, and returns the formatted transcript string along with metadata.
@@ -15,16 +15,16 @@ def get_chat_transcript(checkpoint_id: str, db_path: str):
 
     # Fetch the 40 most recent messages, then sort chronologically in SQL
     cursor.execute('''
-        SELECT message_id, message_text, recorded_at, reply_to_msg_id
+        SELECT message_id, message_text, recorded_at, reply_to_msg_id, sender_id
         FROM (
-            SELECT message_id, message_text, recorded_at, reply_to_msg_id
+            SELECT message_id, message_text, recorded_at, reply_to_msg_id, sender_id
             FROM message_log
-            WHERE checkpoint_id = ? AND recorded_at >= datetime('now', '-8 hours')
+            WHERE checkpoint_id = ? AND recorded_at >= datetime('now', ?)
             ORDER BY recorded_at DESC
             LIMIT 40
         )
         ORDER BY recorded_at ASC
-    ''', (checkpoint_id,))
+    ''', (checkpoint_id, f'-{lookback_hours} hours'))
     
     rows = cursor.fetchall()
     
@@ -33,15 +33,14 @@ def get_chat_transcript(checkpoint_id: str, db_path: str):
         return None, None, 0, None
 
     # First pass: map messages by their ID for rapid lookup    
-    msg_map = {row[0]: {"text": row[1].replace('\n', ' '), "time": row[2]} for row in rows}
+    msg_map = {row[0]: {"text": row[1].replace('\n', ' '), "time": row[2], "sender_id": row[4]} for row in rows}
     
     # Second pass: Build a structured transcript timeline for the LLM
     now_utc = datetime.now(timezone.utc)
     
-    messages = {}
-    roots = []
+    transcript_lines = []
     
-    for msg_id, text, timestamp, reply_to_msg_id in rows:
+    for msg_id, text, timestamp, reply_to_msg_id, sender_id in rows:
         clean_text = text.replace('\n', ' ')
         
         try:
@@ -51,50 +50,23 @@ def get_chat_transcript(checkpoint_id: str, db_path: str):
         except Exception:
             time_label = timestamp
             
-        messages[msg_id] = {
-            "id": msg_id,
-            "text": clean_text,
-            "time_label": time_label,
-            "reply_to": reply_to_msg_id,
-            "children": [],
-            "raw_timestamp": timestamp
-        }
-
-    # Build the tree of replies
-    for msg_id, msg_data in messages.items():
-        parent_id = msg_data["reply_to"]
-        if parent_id and parent_id in messages:
-            messages[parent_id]["children"].append(msg_id)
+        if reply_to_msg_id:
+            if reply_to_msg_id in msg_map:
+                context_string = f"[{time_label}] ID-{msg_id} (REPLY TO ID-{reply_to_msg_id}) (SENDER_ID-{sender_id}): {clean_text}"
+            else:
+                continue
         else:
-            roots.append(msg_id)
-            
-    transcript_lines = []
-    
-    def add_message_and_children(current_id):
-        msg_data = messages[current_id]
-        
-        if msg_data["reply_to"] and msg_data["reply_to"] in messages:
-            parent_id = msg_data["reply_to"]
-            context_string = f"[{msg_data['time_label']}] ID-{msg_data['id']} (REPLY TO ID-{parent_id}): {msg_data['text']}"
-        else:
-            context_string = f"[{msg_data['time_label']}] ID-{msg_data['id']}: {msg_data['text']}"
+            context_string = f"[{time_label}] ID-{msg_id} (SENDER_ID-{sender_id}): {clean_text}"
             
         transcript_lines.append(context_string)
-        
-        for child_id in msg_data["children"]:
-            add_message_and_children(child_id)
-            
-    # Iterate through roots (they are already in chronological order because dict preserves insertion order, which is from chronological query)
-    for root_id in roots:
-        add_message_and_children(root_id)
         
     raw_transcript = "\n".join(transcript_lines)
     
     latest_msg_dt = datetime.strptime(rows[-1][2], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
     
     db_conn.close()
-    
-    return raw_transcript, msg_map, len(rows), latest_msg_dt
+
+    return raw_transcript, msg_map, len(transcript_lines), latest_msg_dt
 
 
 def cleanup_old_messages(checkpoint_id: str, db_path: str):

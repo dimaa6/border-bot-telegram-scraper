@@ -87,7 +87,7 @@ def fetch_nakordoni_multi_data(ppids: List[str], includes: List[str] = None) -> 
         with urllib.request.urlopen(req) as response:
             response_body = response.read().decode('utf-8')
             data = json.loads(response_body)
-            parsed_response = NakordoniMultiResponse(**data)
+            parsed_response = NakordoniMultiResponse.model_validate(data)
             
             if not parsed_response.ok:
                 logger.error("Nakordoni multi API returned ok=false")
