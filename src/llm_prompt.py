@@ -26,6 +26,12 @@ If a message mixes lane types (e.g. reports both red and green, or notes trucks 
 If a reply explicitly contradicts the vehicle type it was asked about (e.g. a question about "легкові авто" answered with "все буси" meaning large coach buses), discard that data — it does not answer the question asked.
 
 === DIRECTION CLASSIFICATION ===
+PRECEDENCE RULE (apply this first, before anything else in this section): if a message contains its own explicit direction token, that token is FINAL and AUTHORITATIVE for
+that message. Do not let adjacent messages, nearby Context Anchor questions, reply chains, or any other contextual signal override, dilute, or reclassify a message that
+already states its own direction explicitly — regardless of how many opposite-direction questions or reports surround it in the transcript. Rules (a) and (b) below apply ONLY
+when a message has no explicit token of its own. Even if 3+ surrounding messages in either direction create a strong topical bias, a message's OWN explicit token always wins.
+Do not let topic density override this.
+
 'to_ukraine' (entering Ukraine): explicit tokens include "в Україну", "до України", "в сторону України", "на в'їзд", "додому", "на UA", or an explicit reference to travelling toward a named Ukrainian city.
 'from_ukraine' (leaving Ukraine, toward foreign country): explicit tokens include "до Польщі/Румунії/Молдови/Словаччини/Угорщини", "в Польщу/Румунію/Молдову/Словаччину/Угорщину", "в сторону Польщі/Румунії/Молдови/Словаччини/Угорщини", "на виїзд", "на ПЛ/РО/МО/СЛ/У", or an explicit reference to travelling toward a named foreign city (e.g. Краків, Варшава).
 A message with no explicit direction token may still be classified if:
@@ -33,6 +39,22 @@ A message with no explicit direction token may still be classified if:
   (b) it directly and topically follows a recent unanswered question about a specific direction, with no intervening unrelated topic — even without any reply marker at all. This is common: people frequently answer as new root-level messages rather than using the reply feature.
 If a message has no explicit token and no reasonable way to infer direction from context, output null for that data point. Do not guess. A fluent Ukrainian speaker's reasonable reading of context is the bar — not 100% mathematical certainty, but genuine ambiguity should still resolve to null.
 You have no reliable knowledge of this checkpoint's specific physical geography (bridges, multiple crossing points, local layout). If correctly attributing a message's direction or location would require inferring unstated local geography, resolve to null rather than guess.
+
+=== LOCATION CLASSIFICATION IS MANDATORY BEFORE EXTRACTION ===
+Before extracting any number, first classify whether it describes PRE-BARRIER (still waiting, extractable) or
+TERRITORY/POST-BARRIER (already past initial processing, NEVER extractable — assumed to be at capacity whenever any pre-barrier queue exists). This classification is
+independent of whether the number is stated precisely or approximately — a precise count on the territory side is just as non-extractable as a vague one.
+If a reply continues or elaborates on a prior message that was itself scoped to the territory (e.g. "термінал повний, за територією не видно" → any reply describing what
+is visible within that scope, such as lane counts or car counts inside the territory, inherits that same territory-only scope and is NEVER extracted, regardless of how
+specific or confident the stated number sounds. Never sum or merge numbers from multiple messages that each individually fail this
+classification check — if a number doesn't qualify for extraction, it contributes nothing to the total, not even as a component to be added to another value.
+
+"Пас" / "на пасах" / "в... пасах" (lane/lanes) refers to PROCESSING LANES WITHIN the barrier/territory area — this is a TERRITORY-equivalent term, NOT a pre-barrier
+staging location. Treat "X машин на пасах" / "по X машин в Y пасах" the same as any other territory/post-barrier reference: NEVER extract these as a pre-barrier queue
+count, regardless of how many lanes are mentioned or how precise the count sounds. This is different from pre-barrier staging terms like "в полі" or "на блокпосту",
+which DO describe cars still waiting before processing and ARE extractable. If a message states a count before the barrier AND separately mentions lane counts
+(e.g. "6 машин перед шлагбаумом і по 9 машин в двох пасах"), extract ONLY the pre-barrier figure (6) — the lane figures are territory-side and must be ignored
+entirely, not summed or listed as additional entries.
 
 === CONTEXT ANCHORS VS DATA PROVIDERS ===
 A Context Anchor is a message asking about queue length, wait time, or movement state (phrased as a question mark, or via "підкажіть", "скажіть будь ласка", "хто знає", "яка ситуація" etc. even without a question mark). Anchors establish direction for replies but are NEVER themselves a source of queue/time data.
@@ -52,6 +74,9 @@ Convert vague approximate phrasing ("+~20", "коло 20", "плюс-мінус 
 Vague-magnitude words with NO number at all ("багато", "величезна", "аж від [landmark]", "кілька", "пару") do not populate `reported_queue_lengths` — treat these as qualitative signals for `movement_state` only.
 Distance-based estimates (km via navigator, e.g. "1.3км показує навігатор") must be IGNORED entirely — never convert distance to an estimated car count.
 
+Do not emit more than one entry for the same source message with identical or near-identical values. Only emit multiple entries from a single message when it
+explicitly describes multiple genuinely distinct segments (see additive checkpoint behavior) — never duplicate a single reported figure into two list entries.
+
 === CROSSING TIME EXTRACTION ===
 Extract `reported_crossing_minutes` only for a FULLY completed crossing, stated as a total duration (e.g. "проїхали за 2 год" -> 120, "перетнули за 10 хвилин" -> 10). 
 Do NOT extract: partial segments (e.g. time from arrival to entering the territory), ongoing/not-yet-finished waits ("вже стоїмо 1.5 год"), or general/typical-duration questions unrelated to right-now conditions ("скільки зазвичай займає перетин").
@@ -62,6 +87,11 @@ Qualitative severity words with no number ("капець", "жах", "все с�
 Classify "standstill" ONLY when at least two independent messages corroborate a complete dead stop / no movement for an extended period. A single unconfirmed report of no movement should be classified as "slowdown" at most.
 
 Extract data with maximum precision. When genuinely uncertain about direction, location, vehicle type, or checkpoint identity, output null rather than guessing — false nulls are far cheaper than false data.
+
+=== MOVEMENT STATE INDEPENDENCE ===
+Each direction's movement_state must be judged using ONLY messages that belong to that specific direction. A chat dominated by from_ukraine slowdown reports must NOT
+influence to_ukraine's movement_state, and vice versa. If a direction has few or no qualifying messages, default that direction's movement_state to "normal" rather than
+inferring it from the other direction's activity or the general tone of the chat.
 """
 
 #   (c) it shares a sender ID (SENDER_ID-XXXX) with a nearby message that already has a

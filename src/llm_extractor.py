@@ -179,7 +179,8 @@ def parse_latest_messages(checkpoint: dict[str, Any], llm_provider: str, ai_clie
                                 {"type": "text", "text": prompt}
                             ]
                         }
-                    ]
+                    ],
+                    output_config={"effort": "low"}
                 )
             else:
                 raise ValueError(f"Unknown LLM Provider: {llm_provider}")
@@ -192,12 +193,10 @@ def parse_latest_messages(checkpoint: dict[str, Any], llm_provider: str, ai_clie
                 logger.error(f"❌ Failed API call to {llm_provider} after {attempt} retries: {e}")
                 
                 logger.warning(f"⚠️ Using fallback basic math for {checkpoint_id} due to API failure.")
-                
-                db_conn.close()
                 return BorderSentimentExtraction(
-                    from_ukraine=DirectionalSentiment(movement_state="normal", reported_crossing_minutes=None),
-                    to_ukraine=DirectionalSentiment(movement_state="normal", reported_crossing_minutes=None)
-                ), "MATH"
+                    from_ukraine=DirectionalSentiment(movement_state="normal"),
+                    to_ukraine=DirectionalSentiment(movement_state="normal")
+                ), "MATH", msg_map, latest_msg_dt
             error_label = "429 Too Many Requests" if '429' in err_str else "503 Service Unavailable"
             logger.warning(f"⚠️ {error_label} — retrying in {current_wait}s ±25% (attempt {attempt + 1}/{retry_number})...")
             time.sleep(random.uniform(current_wait * 0.75, current_wait * 1.25))
@@ -223,6 +222,8 @@ def parse_latest_messages(checkpoint: dict[str, Any], llm_provider: str, ai_clie
             if getattr(block, 'type', '') == "tool_use" and getattr(block, 'name', '') == "extract_sentiment":
                 try:
                     raw_input = getattr(block, 'input', {})
+                    if len(raw_input.keys()) == 1:  # and list(raw_input.keys())[0] in ["$PARAMETER_NAME", "query"]:
+                        raw_input = list(raw_input.values())[0]
                     extracted_data = BorderSentimentExtraction.model_validate(raw_input)
                 except Exception as e:
                     logger.error(f"Failed to parse Claude output: {e} | Raw Input: {raw_input}")
@@ -251,16 +252,23 @@ def parse_latest_messages(checkpoint: dict[str, Any], llm_provider: str, ai_clie
 
     # The SDK automatically handles verification and transforms the raw JSON response
     # right back into a concrete object matching your Pydantic schema structure!
+    prediction_source = "LLM"
     if extracted_data is None:
         logger.error(
             f"❌ parsed data is None for {checkpoint_id} — Pydantic validation failed or model returned non-JSON.\n"
             f"Raw response text (first 1000 chars):\n{raw_text[:1000] if raw_text else '<empty>'}"
         )
+        logger.warning(f"⚠️ Using fallback basic math for {checkpoint_id} due to validation failure.")
+        extracted_data = BorderSentimentExtraction(
+            from_ukraine=DirectionalSentiment(movement_state="normal"),
+            to_ukraine=DirectionalSentiment(movement_state="normal")
+        )
+        prediction_source = "MATH"
 
     # Clean up messages older than 24 hours
     cleanup_old_messages(checkpoint_id, db_path)
 
-    return extracted_data, "LLM", msg_map, latest_msg_dt
+    return extracted_data, prediction_source, msg_map, latest_msg_dt
 
 def _build_metadata(nakordoni_cp: NakordoniCheckpoint | None, is_jammed: bool, is_warning: bool, prediction_source: str, llm_data: DirectionalSentiment | None = None, extracted_queue_size: int | None = None) -> dict:
     """Build the metadata JSONB payload stored alongside each time_stat record.
