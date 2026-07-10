@@ -93,10 +93,17 @@ def calculate_final_wait_time(base_throughput, capacity, queue_size, sentiment, 
     # 4. Enforce floors
     return max(final_minutes, floor_limit)
 
-def parse_latest_messages(checkpoint: dict[str, Any], llm_provider: str, ai_client, openai_client, claude_client, retry_interval: int, retry_number: int):
+def parse_latest_messages(checkpoint: dict[str, Any], llm_provider: str, ai_client, openai_client, claude_client, retry_interval: int, retry_number: int, test_transcript: str = None):
     db_path = os.getenv("DB_PATH", "db/border-bot-telegram-scraper.db")
     checkpoint_id = checkpoint["checkpoint_id"]
-    raw_transcript, msg_map, rows_count, latest_msg_dt = get_chat_transcript(checkpoint_id, db_path, checkpoint["lookback_hours"])
+    
+    if test_transcript:
+        raw_transcript = test_transcript
+        msg_map = {}
+        rows_count = len(test_transcript.splitlines())
+        latest_msg_dt = datetime.now(timezone.utc)
+    else:
+        raw_transcript, msg_map, rows_count, latest_msg_dt = get_chat_transcript(checkpoint_id, db_path, checkpoint["lookback_hours"])
 
     if raw_transcript is None:
         logger.info(f"No messages cached for checkpoint {checkpoint_id}.")
@@ -295,7 +302,22 @@ def process_all_checkpoints():
     # Load configuration once and reuse across all checkpoint calls
     load_dotenv()
 
+    test_transcript_path = os.getenv("TEST_TRANSCRIPT_PATH")
+    test_transcript_content = None
+    target_checkpoint_id = None
+    if test_transcript_path:
+        try:
+            with open(test_transcript_path, 'r', encoding='utf-8') as f:
+                lines = f.read().splitlines()
+            if lines:
+                target_checkpoint_id = lines[0].strip()
+                test_transcript_content = "\n".join(lines[1:])
+        except Exception as e:
+            logger.error(f"Failed to read test transcript from {test_transcript_path}: {e}")
+            return
+
     llm_provider = os.getenv("LLM", "GEMINI").upper()
+
     
     ai_client = None
     openai_client = None
@@ -325,6 +347,13 @@ def process_all_checkpoints():
     supabase = get_supabase_client()
     checkpoints = get_active_checkpoints(supabase)
 
+    if target_checkpoint_id:
+        checkpoints = [cp for cp in checkpoints if cp["checkpoint_id"] == target_checkpoint_id]
+        if not checkpoints:
+            logger.error(f"Test checkpoint {target_checkpoint_id} not found in active checkpoints.")
+            return
+        logger.info(f"TEST MODE: Using transcript from {test_transcript_path} for checkpoint {target_checkpoint_id}")
+
     logger.info("Fetching official queue data from Nakordoni for all checkpoints...")
     nakordoni_all_data = fetch_nakordoni_data()
     logger.info(f"Fetched data for {len(nakordoni_all_data)} checkpoints from Nakordoni.")
@@ -346,7 +375,9 @@ def process_all_checkpoints():
                 matched_nakordoni["OUTBOUND"] = nakordoni_all_data.get(config_matrix.nakordoni.car.outbound_id)
 
         logger.info(f"Processing checkpoint: {checkpoint_id}")
-        metrics, prediction_source, msg_map, latest_msg_dt = parse_latest_messages(cp, llm_provider, ai_client, openai_client, claude_client, retry_interval, retry_number)
+        metrics, prediction_source, msg_map, latest_msg_dt = parse_latest_messages(
+            cp, llm_provider, ai_client, openai_client, claude_client, retry_interval, retry_number, test_transcript_content
+        )
     
         if metrics:
             logger.info(f"★ SUCCESS! Type-Safe Metrics Extracted by {prediction_source} for {checkpoint_id} ★")
@@ -407,7 +438,15 @@ def process_all_checkpoints():
                 valid_queue_reports = [r for r in sentiment_data.reported_queue_lengths if r.value is not None or r.landmark_mentioned is not None]
 
                 if valid_queue_reports:
-                    if segment_mode == "segmented":
+                    if segment_mode == "continuous":
+                        exact_reports = [r for r in valid_queue_reports if not r.is_approximate]
+                        if exact_reports:
+                            latest_queue_report = max(exact_reports, key=lambda x: x.source_message_id)
+                        else:
+                            latest_queue_report = max(valid_queue_reports, key=lambda x: x.source_message_id)
+                        
+                        queue_size = latest_queue_report.value if latest_queue_report else None
+                    else:
                         latest_msg_id = max(r.source_message_id for r in valid_queue_reports)
                         latest_reports = [r for r in valid_queue_reports if r.source_message_id == latest_msg_id]
                         
@@ -421,14 +460,6 @@ def process_all_checkpoints():
                         latest_queue_report = latest_reports[0]
                         if has_value:
                             queue_size = total_queue
-                    else:
-                        exact_reports = [r for r in valid_queue_reports if not r.is_approximate]
-                        if exact_reports:
-                            latest_queue_report = max(exact_reports, key=lambda x: x.source_message_id)
-                        else:
-                            latest_queue_report = max(valid_queue_reports, key=lambda x: x.source_message_id)
-                        
-                        queue_size = latest_queue_report.value if latest_queue_report else None
 
                 latest_time_report = None
                 if sentiment_data.reported_crossing_minutes:
@@ -449,7 +480,7 @@ def process_all_checkpoints():
                             if queue_size is None:
                                 queue_size = landmark_queue_val
                                 logger.info(f"Resolved landmark '{normalized_landmark}' to queue size {queue_size} for {direction_name}.")
-                            elif segment_mode != "segmented":
+                            elif segment_mode == "continuous":
                                 queue_size += landmark_queue_val
                                 logger.info(f"Added landmark '{normalized_landmark}' ({landmark_queue_val}) to explicit queue size. New total: {queue_size} for {direction_name}.")
 

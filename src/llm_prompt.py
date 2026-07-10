@@ -6,8 +6,8 @@ Your sole task is to analyze a raw chat log and extract passenger-vehicle traffi
 
 === INPUT FORMAT ===
 Each line follows one of two exact formats, in chronological order (oldest first):
-1. `[X minutes ago] ID-12345 (SENDER_ID-43434): Message text...` (standalone message)
-2. `[X minutes ago] ID-12345 (REPLY TO ID-67890) (SENDER_ID-43434): Message text...` (threaded reply)
+1. `[X minutes ago] ID-12345: Message text...` (standalone message)
+2. `[X minutes ago] ID-12345 (REPLY TO ID-67890): Message text...` (threaded reply)
 
 If a message's `REPLY TO ID-XXXX` target does not appear anywhere in this transcript, treat that message as if it had no reply metadata at all — do not assume or invent the parent's content.
 
@@ -31,14 +31,6 @@ If a reply explicitly contradicts the vehicle type it was asked about (e.g. a qu
 A message with no explicit direction token may still be classified if:
   (a) it is a reply (explicit or clearly implicit) to a message that already establishes a direction — inherit that direction. Walk the reply chain (which may mix explicit REPLY TO links and implicit adjacency) until you find an explicit token or a Context Anchor question.
   (b) it directly and topically follows a recent unanswered question about a specific direction, with no intervening unrelated topic — even without any reply marker at all. This is common: people frequently answer as new root-level messages rather than using the reply feature.
-  (c) it shares a sender ID (SENDER_ID-XXXX) with a nearby message that already has a
-      resolved direction (from an explicit token, reply chain, or rule (b) above) — the
-      same person is likely continuing their own earlier answer. Sender-match is a
-      supporting signal, not a standalone trigger: use it to reinforce or tie-break
-      between (a)/(b) when adjacency alone is ambiguous, but do not let it override a
-      clear, unambiguous direction token present elsewhere in the message itself. Two
-      different senders discussing the same topic are independent reports, not a
-      continuation, even if adjacent.
 If a message has no explicit token and no reasonable way to infer direction from context, output null for that data point. Do not guess. A fluent Ukrainian speaker's reasonable reading of context is the bar — not 100% mathematical certainty, but genuine ambiguity should still resolve to null.
 You have no reliable knowledge of this checkpoint's specific physical geography (bridges, multiple crossing points, local layout). If correctly attributing a message's direction or location would require inferring unstated local geography, resolve to null rather than guess.
 
@@ -71,6 +63,16 @@ Classify "standstill" ONLY when at least two independent messages corroborate a 
 
 Extract data with maximum precision. When genuinely uncertain about direction, location, vehicle type, or checkpoint identity, output null rather than guessing — false nulls are far cheaper than false data.
 """
+
+#   (c) it shares a sender ID (SENDER_ID-XXXX) with a nearby message that already has a
+#       resolved direction (from an explicit token, reply chain, or rule (b) above) — the
+#       same person is likely continuing their own earlier answer. Sender-match is a
+#       supporting signal, not a standalone trigger: use it to reinforce or tie-break
+#       between (a)/(b) when adjacency alone is ambiguous, but do not let it override a
+#       clear, unambiguous direction token present elsewhere in the message itself. Two
+#       different senders discussing the same topic are independent reports, not a
+#       continuation, even if adjacent.
+
 
 CHECKPOINT_SPECIFIC = """Checkpoint names: (Ukrainian side: {checkpoint_name}; {foreign_country_name} side: {counterpart_name})
 

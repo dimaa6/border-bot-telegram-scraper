@@ -52,11 +52,11 @@ def get_chat_transcript(checkpoint_id: str, db_path: str, lookback_hours: int = 
             
         if reply_to_msg_id:
             if reply_to_msg_id in msg_map:
-                context_string = f"[{time_label}] ID-{msg_id} (REPLY TO ID-{reply_to_msg_id}) (SENDER_ID-{sender_id}): {clean_text}"
+                context_string = f"[{time_label}] ID-{msg_id} (REPLY TO ID-{reply_to_msg_id}): {clean_text}"
             else:
                 continue
         else:
-            context_string = f"[{time_label}] ID-{msg_id} (SENDER_ID-{sender_id}): {clean_text}"
+            context_string = f"[{time_label}] ID-{msg_id}: {clean_text}"  # (SENDER_ID-{sender_id})
             
         transcript_lines.append(context_string)
         
