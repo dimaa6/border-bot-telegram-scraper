@@ -32,10 +32,16 @@ already states its own direction explicitly — regardless of how many opposite-
 when a message has no explicit token of its own. Even if 3+ surrounding messages in either direction create a strong topical bias, a message's OWN explicit token always wins.
 Do not let topic density override this.
 
-'to_ukraine' (entering Ukraine): explicit tokens include "в Україну", "до України", "в сторону України", "на в'їзд", "додому", "на UA", or an explicit reference to travelling toward a named Ukrainian city.
-'from_ukraine' (leaving Ukraine, toward foreign country): explicit tokens include "до Польщі/Румунії/Молдови/Словаччини/Угорщини", "в Польщу/Румунію/Молдову/Словаччину/Угорщину", "в сторону Польщі/Румунії/Молдови/Словаччини/Угорщини", "на виїзд", "на ПЛ/РО/МО/СЛ/У", or an explicit reference to travelling toward a named foreign city (e.g. Краків, Варшава).
+'to_ukraine' (entering Ukraine): explicit tokens include "в Україну", "до України", "в сторону України", "на в'їзд", "додому", "на UA", an explicit reference to travelling toward a
+named Ukrainian city, OR an explicit reference to travelling FROM a foreign country/city ("з Польщі", "із Румунії", "з Кракова", "from Poland") — since coming FROM abroad means entering Ukraine.
+'from_ukraine' (leaving Ukraine, toward foreign country): explicit tokens include "до Польщі/Румунії/Молдови/Словаччини/Угорщини", "в Польщу/Румунію/Молдову/Словаччину/Угорщину",
+"в сторону Польщі/Румунії/Молдови/Словаччини/Угорщини", "на виїзд", "на ПЛ/РО/МО/СЛ/У", an explicit reference to travelling toward a named foreign city, OR an explicit reference to
+travelling FROM Ukraine/a named Ukrainian city ("з України", "зі Львова", "from Ukraine") — since coming FROM Ukraine means heading abroad.
 A message with no explicit direction token may still be classified if:
-  (a) it is a reply (explicit or clearly implicit) to a message that already establishes a direction — inherit that direction. Walk the reply chain (which may mix explicit REPLY TO links and implicit adjacency) until you find an explicit token or a Context Anchor question.
+  (a) it is a reply (explicit or clearly implicit) to a message that already establishes a direction — inherit that direction. Walk the reply chain (which may mix explicit REPLY TO
+  links and implicit adjacency) until you find an explicit token or a Context Anchor question. An explicit REPLY TO link is authoritative regardless of how many intervening messages —
+  of any topic or direction — appear between the reply and its parent in the transcript; do not let physical proximity to OTHER messages override a direction established via an explicit
+  reply chain, no matter the distance involved.
   (b) it directly and topically follows a recent unanswered question about a specific direction, with no intervening unrelated topic — even without any reply marker at all. This is common: people frequently answer as new root-level messages rather than using the reply feature.
 If a message has no explicit token and no reasonable way to infer direction from context, output null for that data point. Do not guess. A fluent Ukrainian speaker's reasonable reading of context is the bar — not 100% mathematical certainty, but genuine ambiguity should still resolve to null.
 You have no reliable knowledge of this checkpoint's specific physical geography (bridges, multiple crossing points, local layout). If correctly attributing a message's direction or location would require inferring unstated local geography, resolve to null rather than guess.
