@@ -1,0 +1,54 @@
+{
+    "from_ukraine": {
+        "movement_state": "slowdown",
+        "reported_crossing_minutes": [
+        ],
+        "reported_queue_lengths": [
+            {
+                "source_message_id": 450867,
+                "value": 100,
+                "is_approximate": false,
+                "landmark_mentioned": null
+            },
+            {
+                "source_message_id": 450880,
+                "value": 160,
+                "is_approximate": true,
+                "landmark_mentioned": null
+            },
+            {
+                "source_message_id": 450899,
+                "value": null,
+                "is_approximate": false,
+                "landmark_mentioned": null
+            }
+        ]
+    },
+    "to_ukraine": {
+        "movement_state": "normal",
+        "reported_crossing_minutes": [
+            {
+                "source_message_id": 450869,
+                "value": 25
+            },
+            {
+                "source_message_id": 450900,
+                "value": 60
+            }
+        ],
+        "reported_queue_lengths": [
+            {
+                "source_message_id": 450854,
+                "value": 15,
+                "is_approximate": false,
+                "landmark_mentioned": null
+            },
+            {
+                "source_message_id": 450890,
+                "value": 30,
+                "is_approximate": true,
+                "landmark_mentioned": null
+            }
+        ]
+    }
+}

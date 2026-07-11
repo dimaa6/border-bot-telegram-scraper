@@ -180,7 +180,7 @@ def parse_latest_messages(checkpoint: dict[str, Any], llm_provider: str, ai_clie
                             ]
                         }
                     ],
-                    output_config={"effort": "low"}
+                    output_config={"effort": "medium"}
                 )
             else:
                 raise ValueError(f"Unknown LLM Provider: {llm_provider}")

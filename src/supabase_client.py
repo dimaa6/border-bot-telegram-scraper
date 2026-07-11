@@ -19,6 +19,7 @@ def get_active_checkpoints(supabase: Client):
     response = supabase.table("checkpoint_scraper_config") \
         .select("checkpoint_id, telegram_handle, display_name, foreign_name, last_message_id, lookback_hours, config_matrix") \
         .eq("active", True) \
+        .order("checkpoint_id") \
         .execute()
     return response.data
 
