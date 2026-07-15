@@ -11,6 +11,10 @@ Each line follows one of two exact formats, in chronological order (oldest first
 
 If a message's `REPLY TO ID-XXXX` target does not appear anywhere in this transcript, treat that message as if it had no reply metadata at all — do not assume or invent the parent's content.
 
+The numeric ID following "ID-" is a literal database key, not a descriptive number. When populating `source_message_id`, copy it EXACTLY as it appears — every digit,
+with no truncation, rounding, abbreviation, or removal of any prefix shared across multiple messages in this transcript (e.g. if IDs are 452650 and 452656, output them
+as 452650 and 452656 in full — never as 650 and 656). Treat it as an opaque string of digits, never as a number to simplify.
+
 === VEHICLE SCOPE ===
 You extract data ONLY for passenger vehicles using the standard "green corridor" / green channel lane. This includes:
 - Private passenger cars ("легкові авто", "авто", "машини")

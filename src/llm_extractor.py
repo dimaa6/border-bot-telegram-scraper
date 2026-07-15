@@ -11,7 +11,7 @@ import anthropic
 from typing import Literal, Any
 from log_setup import configure_logging
 from config_matrix import ConfigMatrix
-from supabase_client import get_supabase_client, get_active_checkpoints, insert_time_stats, get_queue_history
+from supabase_client import get_supabase_client, get_active_checkpoints, insert_time_stats, get_queue_history, insert_sentiment_reports
 from nakordoni_client import fetch_nakordoni_data, NakordoniCheckpoint
 from filter import extrapolate_trend_proxy
 from transcript_builder import get_chat_transcript, cleanup_old_messages
@@ -149,7 +149,8 @@ def parse_latest_messages(checkpoint: dict[str, Any], llm_provider: str, ai_clie
                     model='gpt-5.4-mini',
                     messages=messages,
                     response_format=BorderSentimentExtraction,
-                    temperature=0.0,
+                    # temperature=0.0,
+                    reasoning_effort="medium"
                 )
             elif llm_provider == "CLAUDE":
                 schema = BorderSentimentExtraction.model_json_schema()
@@ -561,7 +562,7 @@ def process_all_checkpoints():
                     if fallback_times:
                         extracted_at = max(fallback_times)
     
-                return {
+                time_stat = {
                     "checkpoint_id": checkpoint_id,
                     "direction": direction_name,
                     "transport_type": "car",
@@ -579,9 +580,33 @@ def process_all_checkpoints():
                     ),
                 }
     
-            stats_to_insert = []
+                sentiment_payload = {
+                    "checkpoint_id": checkpoint_id,
+                    "direction": direction_name,
+                    "transport_type": "car",
+                    "movement_state": sentiment_data.movement_state,
+                    "time_reports": [
+                        {
+                            "reported_time_minutes": r.value,
+                            "source_message_id": r.source_message_id
+                        } for r in sentiment_data.reported_crossing_minutes
+                    ],
+                    "queue_reports": [
+                        {
+                            "reported_queue_length": r.value,
+                            "source_message_id": r.source_message_id,
+                            "is_approximate": r.is_approximate,
+                            "landmark_mentioned": r.landmark_mentioned
+                        } for r in sentiment_data.reported_queue_lengths
+                    ]
+                }
     
-            outbound_stat = process_direction(
+                return time_stat, sentiment_payload
+    
+            stats_to_insert = []
+            sentiments_to_insert = []
+    
+            outbound_result = process_direction(
                 sentiment_data=metrics.from_ukraine,
                 direction_name="OUTBOUND",
                 nakordoni_data=matched_nakordoni.get("OUTBOUND"),
@@ -596,12 +621,13 @@ def process_all_checkpoints():
                 landmark_rules=config_matrix.ai_heuristics.landmark_rules if config_matrix.ai_heuristics else None,
                 segment_mode=config_matrix.ai_heuristics.segment_mode if config_matrix.ai_heuristics else None
             )
-            if outbound_stat:
-                stats_to_insert.append(outbound_stat)
+            if outbound_result:
+                stats_to_insert.append(outbound_result[0])
+                sentiments_to_insert.append(outbound_result[1])
     
             inbound_nakordoni = matched_nakordoni.get("INBOUND")
     
-            inbound_stat = process_direction(
+            inbound_result = process_direction(
                 sentiment_data=metrics.to_ukraine,
                 direction_name="INBOUND",
                 nakordoni_data=inbound_nakordoni,
@@ -616,8 +642,9 @@ def process_all_checkpoints():
                 landmark_rules=config_matrix.ai_heuristics.landmark_rules if config_matrix.ai_heuristics else None,
                 segment_mode=config_matrix.ai_heuristics.segment_mode if config_matrix.ai_heuristics else None
             )
-            if inbound_stat:
-                stats_to_insert.append(inbound_stat)
+            if inbound_result:
+                stats_to_insert.append(inbound_result[0])
+                sentiments_to_insert.append(inbound_result[1])
     
             if stats_to_insert:
                 try:
@@ -625,6 +652,13 @@ def process_all_checkpoints():
                     logger.info(f"-> Saved {len(stats_to_insert)} records to 'time_stat' table in Supabase.")
                 except Exception as e:
                     logger.error(f"❌ Error saving to Supabase 'time_stat' table: {e}", exc_info=True)
+    
+            if sentiments_to_insert:
+                try:
+                    insert_sentiment_reports(supabase, sentiments_to_insert)
+                    logger.info(f"-> Saved {len(sentiments_to_insert)} sentiment records to Supabase.")
+                except Exception as e:
+                    logger.error(f"❌ Error saving to Supabase sentiment tables: {e}", exc_info=True)
     
         is_last = j == (len(checkpoints) - 1)
         if not is_last:
