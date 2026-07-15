@@ -67,3 +67,35 @@ def get_queue_history(supabase: Client, checkpoint_id: str, direction: str, limi
 def insert_time_stats(supabase: Client, stats: list) -> None:
     """Insert a list of time_stat prediction records into Supabase."""
     supabase.table("time_stat").insert(stats).execute()
+
+def insert_sentiment_reports(supabase: Client, reports: list[dict]) -> None:
+    """Insert directional sentiments and their associated time and queue reports."""
+    for report in reports:
+        # Insert parent record
+        sentiment_res = supabase.table("directional_sentiment").insert({
+            "checkpoint_id": report["checkpoint_id"],
+            "direction": report["direction"],
+            "transport_type": report["transport_type"],
+            "movement_state": report["movement_state"]
+        }).execute()
+        
+        if sentiment_res.data:
+            sentiment_id = sentiment_res.data[0]["id"]
+            
+            # Insert time reports
+            time_reports = report.get("time_reports", [])
+            if time_reports:
+                time_reports_to_insert = [
+                    {**tr, "directional_sentiment_id": sentiment_id}
+                    for tr in time_reports
+                ]
+                supabase.table("time_report").insert(time_reports_to_insert).execute()
+                
+            # Insert queue reports
+            queue_reports = report.get("queue_reports", [])
+            if queue_reports:
+                queue_reports_to_insert = [
+                    {**qr, "directional_sentiment_id": sentiment_id}
+                    for qr in queue_reports
+                ]
+                supabase.table("queue_report").insert(queue_reports_to_insert).execute()
