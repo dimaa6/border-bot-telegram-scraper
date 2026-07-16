@@ -1,4 +1,51 @@
 from typing import Literal, Any
+from pydantic import BaseModel, Field
+
+
+class QueueReport(BaseModel):
+    value: int | None = Field(
+        default=None,
+        description="Reported pre-barrier queue length as a best integer estimate. Null if only a landmark reference was given, with no explicit count."
+    )
+    source_message_id: int
+    is_approximate: bool = Field(
+        default=False,
+        description="True if the message expressed this as a rough/uncertain estimate ('+~20', 'коло 20', 'приблизно', 'не бачу точно') rather than a precise stated count."
+    )
+    location_segment: str | None = Field(
+        default=None,
+        description="If this checkpoint has multiple distinct queue segments (e.g. 'блокпост', 'перед шлагбаумом', 'в полі'), and the message specifies which one this count describes, populate the segment's normalized label here. Null if the checkpoint is continuous (single queue) or the message doesn't specify a segment."
+    )
+    landmark_mentioned: str | None = Field(
+        default=None,
+        description="If the message references a named landmark from this checkpoint's list to describe queue extent, copy the normalized label here — REGARDLESS of whether an explicit count is also given in the same message."
+    )
+
+
+class TimeReport(BaseModel):
+    value: int = Field(
+        description="Completed total crossing time in minutes (e.g., '2 години' -> 120, '1.5 год' -> 90). Only for FULLY completed crossings, never partial segments."
+    )
+    source_message_id: int
+
+
+class DirectionalSentiment(BaseModel):
+    movement_state: Literal["normal", "slowdown", "standstill", "accelerated"] = Field(
+        description=(
+            "'standstill': at least TWO independent messages report a complete dead stop / no movement for an extended period. "
+            "'slowdown': a single no-movement report, OR general complaints of slow processing, long waits, closed lanes, low throughput rate. "
+            "'accelerated': extra lanes opening or traffic explicitly clearing/moving fast. "
+            "'normal': default when quiet, routine, or steady movement is reported."
+        )
+    )
+    reported_crossing_minutes: list[TimeReport] = Field(default_factory=list)
+    reported_queue_lengths: list[QueueReport] = Field(default_factory=list)
+
+
+class BorderSentimentExtraction(BaseModel):
+    from_ukraine: DirectionalSentiment = Field(description="Traffic leaving Ukraine, heading to Poland")
+    to_ukraine: DirectionalSentiment = Field(description="Traffic entering Ukraine from Poland")
+
 
 SYSTEM_PROMPT_TEMPLATE = """You are a qualitative data extraction engine for Ukrainian border checkpoint.
 
@@ -145,6 +192,18 @@ Correct extraction for the passenger-vehicle report: value=null, landmark_mentio
 INCORRECT: landmark_mentioned="roundabout" — this wrongly borrows the bus's landmark for the car queue.
 """
 
+LOCATION_SEGMENTS = """=== LOCATION SEGMENTS for this checkpoint (recognize these and close variants/misspellings) ===
+- "staging" — matches: блокпост, блок пост, блок-пост, на блокпосту, на посту, в полі, на полі, поле
+- "barrier" — matches: шлагбаум, перед шлагбаумом, до шлагбауму, світлофор, перед світлофором, до світлофора
+
+If a message specifies which segment a count describes, populate `location_segment` with the NORMALIZED label shown above (e.g. "staging", not the raw text from the
+message). If the segment mentioned doesn't clearly match one of these, leave `location_segment` null rather than inventing a new label — an unmatched segment name
+is safer treated as unknown than as a new, unrecognized bucket.
+
+If ONE message reports counts at multiple distinct pre-barrier locations (e.g. 'в полі' and 'перед шлагбаумом'), extract EACH as a SEPARATE entry in the list
+(same source_message_id for both) — these are components of one physical queue, not competing estimates.
+"""
+
 def build_prompt(
     checkpoint_config: dict[str, Any],
 ) -> tuple[str, str]:
@@ -166,12 +225,7 @@ def build_prompt(
     }.get(prefix, "neighboring country")
 
     if segment_mode == "additive":
-        segment_instruction = (
-            "This checkpoint stages cars across multiple pre-barrier reference points to avoid a single "
-            "massive line at the barrier. If ONE message reports counts at multiple distinct pre-barrier "
-            "locations (e.g. 'в полі' and 'перед шлагбаумом'), extract EACH as a SEPARATE entry in the list "
-            "(same source_message_id for both) — these are components of one physical queue, not competing estimates."
-        )
+        segment_instruction = LOCATION_SEGMENTS
     else:
         segment_instruction = (
             "This checkpoint has one continuous queue; landmark/location references just mark rough distance "

@@ -15,7 +15,7 @@ from supabase_client import get_supabase_client, get_active_checkpoints, insert_
 from nakordoni_client import fetch_nakordoni_data, NakordoniCheckpoint
 from filter import extrapolate_trend_proxy
 from transcript_builder import get_chat_transcript, cleanup_old_messages
-from llm_prompt import build_prompt
+from llm_prompt import build_prompt, QueueReport, TimeReport, DirectionalSentiment, BorderSentimentExtraction
 
 # Hard minimum crossing times — enforced in code after LLM response, regardless of queue size
 MIN_OUTBOUND_MINUTES = 60  # Leaving Ukraine → Poland: exit control + customs + crossing + Schengen/Polish entry
@@ -26,43 +26,6 @@ load_dotenv()
 
 # --- LOGGING SETUP ---
 logger = configure_logging("llm_extractor.log")
-
-class QueueReport(BaseModel):
-    value: int | None = Field(
-        default=None,
-        description="Reported pre-barrier queue length as a best integer estimate. Null if only a landmark reference was given, with no explicit count."
-    )
-    source_message_id: int
-    is_approximate: bool = Field(
-        default=False,
-        description="True if the message expressed this as a rough/uncertain estimate ('+~20', 'коло 20', 'приблизно', 'не бачу точно') rather than a precise stated count."
-    )
-    landmark_mentioned: str | None = Field(
-        default=None,
-        description="If the message references a named landmark from this checkpoint's list to describe queue extent, copy the normalized label here — REGARDLESS of whether an explicit count is also given in the same message."
-    )
-
-class TimeReport(BaseModel):
-    value: int = Field(
-        description="Completed total crossing time in minutes (e.g., '2 години' -> 120, '1.5 год' -> 90). Only for FULLY completed crossings, never partial segments."
-    )
-    source_message_id: int
-
-class DirectionalSentiment(BaseModel):
-    movement_state: Literal["normal", "slowdown", "standstill", "accelerated"] = Field(
-        description=(
-            "'standstill': at least TWO independent messages report a complete dead stop / no movement for an extended period. "
-            "'slowdown': a single no-movement report, OR general complaints of slow processing, long waits, closed lanes, low throughput rate. "
-            "'accelerated': extra lanes opening or traffic explicitly clearing/moving fast. "
-            "'normal': default when quiet, routine, or steady movement is reported."
-        )
-    )
-    reported_crossing_minutes: list[TimeReport] = Field(default_factory=list)
-    reported_queue_lengths: list[QueueReport] = Field(default_factory=list)
-
-class BorderSentimentExtraction(BaseModel):
-    from_ukraine: DirectionalSentiment = Field(description="Traffic leaving Ukraine, heading to Poland")
-    to_ukraine: DirectionalSentiment = Field(description="Traffic entering Ukraine from Poland")
 
 def calculate_final_wait_time(base_throughput, capacity, queue_size, sentiment, floor_limit):
     # 1. Calculate the standard baseline minutes
@@ -456,19 +419,47 @@ def process_all_checkpoints():
                         
                         queue_size = latest_queue_report.value if latest_queue_report else None
                     else:
-                        latest_msg_id = max(r.source_message_id for r in valid_queue_reports)
-                        latest_reports = [r for r in valid_queue_reports if r.source_message_id == latest_msg_id]
-                        
-                        total_queue = 0
-                        has_value = False
-                        for r in latest_reports:
+                        barrier_reports = []
+                        staging_reports = []
+                        for r in valid_queue_reports:
                             if r.value is not None:
-                                total_queue += r.value
-                                has_value = True
+                                segment = (r.location_segment or "barrier").lower()
+                                if segment == "staging":
+                                    staging_reports.append(r)
+                                else:
+                                    barrier_reports.append(r)
                         
-                        latest_queue_report = latest_reports[0]
-                        if has_value:
-                            queue_size = total_queue
+                        latest_barrier = max(barrier_reports, key=lambda x: x.source_message_id) if barrier_reports else None
+                        latest_staging = max(staging_reports, key=lambda x: x.source_message_id) if staging_reports else None
+
+                        if latest_barrier and latest_staging:
+                            barrier_msg = msg_map.get(latest_barrier.source_message_id)
+                            staging_msg = msg_map.get(latest_staging.source_message_id)
+                            
+                            barrier_time = None
+                            staging_time = None
+                            if barrier_msg:
+                                barrier_time = datetime.strptime(barrier_msg["time"], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                            if staging_msg:
+                                staging_time = datetime.strptime(staging_msg["time"], '%Y-%m-%d %H:%M:%S').replace(tzinfo=timezone.utc)
+                                
+                            if barrier_time and staging_time:
+                                diff_mins = abs((barrier_time - staging_time).total_seconds()) / 60.0
+                                if diff_mins > 30:
+                                    if barrier_time > staging_time:
+                                        queue_size = latest_barrier.value
+                                    else:
+                                        queue_size = latest_staging.value
+                                else:
+                                    queue_size = latest_barrier.value + latest_staging.value
+                            else:
+                                queue_size = latest_barrier.value + latest_staging.value
+                        elif latest_barrier:
+                            queue_size = latest_barrier.value
+                        elif latest_staging:
+                            queue_size = latest_staging.value
+
+                        latest_queue_report = max(valid_queue_reports, key=lambda x: x.source_message_id)
 
                 latest_time_report = None
                 if sentiment_data.reported_crossing_minutes:
@@ -596,7 +587,8 @@ def process_all_checkpoints():
                             "reported_queue_length": r.value,
                             "source_message_id": r.source_message_id,
                             "is_approximate": r.is_approximate,
-                            "landmark_mentioned": r.landmark_mentioned
+                            "landmark_mentioned": r.landmark_mentioned,
+                            "segment_mentioned": r.location_segment
                         } for r in sentiment_data.reported_queue_lengths
                     ]
                 }
