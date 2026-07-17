@@ -84,7 +84,8 @@ when a message has no explicit token of its own. Even if 3+ surrounding messages
 Do not let topic density override this.
 
 'to_ukraine' (entering Ukraine): explicit tokens include "в Україну", "до України", "в сторону України", "на в'їзд", "додому", "на UA", an explicit reference to travelling toward a
-named Ukrainian city, OR an explicit reference to travelling FROM a foreign country/city ("з Польщі", "із Румунії", "з Кракова", "from Poland") — since coming FROM abroad means entering Ukraine.
+named Ukrainian city, OR an explicit reference to travelling FROM a foreign country/city ("з Польщі", "із Румунії", "з Кракова", "from Poland") — since coming FROM abroad means
+entering Ukraine, OR both tokens combined: "з Польщі до України".
 'from_ukraine' (leaving Ukraine, toward foreign country): explicit tokens include "до Польщі/Румунії/Молдови/Словаччини/Угорщини", "в Польщу/Румунію/Молдову/Словаччину/Угорщину",
 "в сторону Польщі/Румунії/Молдови/Словаччини/Угорщини", "на виїзд", "на ПЛ/РО/МО/СЛ/У", an explicit reference to travelling toward a named foreign city, OR an explicit reference to
 travelling FROM Ukraine/a named Ukrainian city ("з України", "зі Львова", "from Ukraine") — since coming FROM Ukraine means heading abroad.

@@ -1,7 +1,26 @@
 import os
+import re
 import sqlite3
 import logging
 from datetime import datetime, timezone, timedelta
+
+def parse_test_transcript(test_transcript: str) -> dict:
+    msg_map = {}
+    now_utc = datetime.now(timezone.utc)
+    pattern = re.compile(r"\[(\d+)\s*minutes\s*ago\]\s*ID-(\d+)(?:\s*\(REPLY TO ID-\d+\))?:\s*(.*)")
+    for line in test_transcript.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        match = pattern.match(line)
+        if match:
+            minutes_ago = int(match.group(1))
+            msg_id = int(match.group(2))
+            text = match.group(3)
+            msg_dt = now_utc - timedelta(minutes=minutes_ago)
+            time_str = msg_dt.strftime('%Y-%m-%d %H:%M:%S')
+            msg_map[msg_id] = {"text": text, "time": time_str, "sender_id": None}
+    return msg_map
 
 logger = logging.getLogger(__name__)
 
