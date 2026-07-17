@@ -14,7 +14,7 @@ from config_matrix import ConfigMatrix
 from supabase_client import get_supabase_client, get_active_checkpoints, insert_time_stats, get_queue_history, insert_sentiment_reports
 from nakordoni_client import fetch_nakordoni_data, NakordoniCheckpoint
 from filter import extrapolate_trend_proxy
-from transcript_builder import get_chat_transcript, cleanup_old_messages
+from transcript_builder import get_chat_transcript, cleanup_old_messages, parse_test_transcript
 from llm_prompt import build_prompt, QueueReport, TimeReport, DirectionalSentiment, BorderSentimentExtraction
 
 # Hard minimum crossing times — enforced in code after LLM response, regardless of queue size
@@ -26,6 +26,50 @@ load_dotenv()
 
 # --- LOGGING SETUP ---
 logger = configure_logging("llm_extractor.log")
+
+
+FOREIGN_PATTERNS = ["польщ", "польш", "поляк"]
+UKRAINE_PATTERNS = ["україн"]
+
+FROM_PREPOSITIONS = ["з", "із", "від"]
+TO_PREPOSITIONS = ["до", "в", "у", "в бік", "у бік", "в сторону", "у сторону", "на"]
+EXPLICIT_INBOUND = ["додому", "до дому"]
+EXPLICIT_OUTBOUND = ["на виїзд"]
+
+def detect_direction(text: str) -> str | None:
+    text = text.lower()
+    text = " ".join(text.split())
+    
+    inbound_found = False
+    outbound_found = False
+    
+    if any(p in text for p in EXPLICIT_INBOUND):
+        inbound_found = True
+    if any(p in text for p in EXPLICIT_OUTBOUND):
+        outbound_found = True
+        
+    for f_prep in FROM_PREPOSITIONS:
+        for f_pat in FOREIGN_PATTERNS:
+            if f"{f_prep} {f_pat}" in text:
+                inbound_found = True
+        for u_pat in UKRAINE_PATTERNS:
+            if f"{f_prep} {u_pat}" in text:
+                outbound_found = True
+                
+    for t_prep in TO_PREPOSITIONS:
+        for f_pat in FOREIGN_PATTERNS:
+            if f"{t_prep} {f_pat}" in text:
+                outbound_found = True
+        for u_pat in UKRAINE_PATTERNS:
+            if f"{t_prep} {u_pat}" in text:
+                inbound_found = True
+                
+    if inbound_found and not outbound_found:
+        return "INBOUND"
+    elif outbound_found and not inbound_found:
+        return "OUTBOUND"
+    return None
+
 
 def calculate_final_wait_time(base_throughput, capacity, queue_size, sentiment, floor_limit):
     # 1. Calculate the standard baseline minutes
@@ -62,7 +106,7 @@ def parse_latest_messages(checkpoint: dict[str, Any], llm_provider: str, ai_clie
     
     if test_transcript:
         raw_transcript = test_transcript
-        msg_map = {}
+        msg_map = parse_test_transcript(test_transcript)
         rows_count = len(test_transcript.splitlines())
         latest_msg_dt = datetime.now(timezone.utc)
     else:
@@ -87,7 +131,7 @@ def parse_latest_messages(checkpoint: dict[str, Any], llm_provider: str, ai_clie
             if llm_provider == "GEMINI":
                 response = ai_client.models.generate_content(
                     model='gemini-2.5-flash',  # Fast, highly optimized for text extraction and incredibly cheap
-                    contents=prompt,
+                    contents=[checkpoint_block, prompt],
                     config=types.GenerateContentConfig(
                         system_instruction=system_instruction,
                         # These two parameters force the structured JSON extraction matching our Pydantic class
@@ -403,6 +447,28 @@ def process_all_checkpoints():
             ):
                 if not sentiment_data:
                     return None
+
+                valid_qr = []
+                for r in sentiment_data.reported_queue_lengths:
+                    msg_info = msg_map.get(r.source_message_id)
+                    if msg_info:
+                        detected = detect_direction(msg_info["text"])
+                        if detected and detected != direction_name:
+                            logger.warning(f"Message {r.source_message_id}: assigned {direction_name} but detected {detected} — ignoring queue report")
+                            continue
+                    valid_qr.append(r)
+                sentiment_data.reported_queue_lengths = valid_qr
+
+                valid_tr = []
+                for r in sentiment_data.reported_crossing_minutes:
+                    msg_info = msg_map.get(r.source_message_id)
+                    if msg_info:
+                        detected = detect_direction(msg_info["text"])
+                        if detected and detected != direction_name:
+                            logger.warning(f"Message {r.source_message_id}: assigned {direction_name} but detected {detected} — ignoring time report")
+                            continue
+                    valid_tr.append(r)
+                sentiment_data.reported_crossing_minutes = valid_tr
 
                 latest_queue_report = None
                 queue_size = None
