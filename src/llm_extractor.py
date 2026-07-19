@@ -274,7 +274,8 @@ def parse_latest_messages(checkpoint: dict[str, Any], llm_provider: str, ai_clie
         prediction_source = "MATH"
 
     # Clean up messages older than 24 hours
-    cleanup_old_messages(checkpoint_id, db_path)
+    if not test_transcript:
+        cleanup_old_messages(checkpoint_id, db_path)
 
     return extracted_data, prediction_source, msg_map, latest_msg_dt
 
@@ -704,19 +705,22 @@ def process_all_checkpoints():
                 stats_to_insert.append(inbound_result[0])
                 sentiments_to_insert.append(inbound_result[1])
     
-            if stats_to_insert:
-                try:
-                    insert_time_stats(supabase, stats_to_insert)
-                    logger.info(f"-> Saved {len(stats_to_insert)} records to 'time_stat' table in Supabase.")
-                except Exception as e:
-                    logger.error(f"❌ Error saving to Supabase 'time_stat' table: {e}", exc_info=True)
+            if test_transcript_content:
+                logger.info("TEST MODE: Skipping DB insert for file transcript execution.")
+            else:
+                if stats_to_insert:
+                    try:
+                        insert_time_stats(supabase, stats_to_insert)
+                        logger.info(f"-> Saved {len(stats_to_insert)} records to 'time_stat' table in Supabase.")
+                    except Exception as e:
+                        logger.error(f"❌ Error saving to Supabase 'time_stat' table: {e}", exc_info=True)
     
-            if sentiments_to_insert:
-                try:
-                    insert_sentiment_reports(supabase, sentiments_to_insert)
-                    logger.info(f"-> Saved {len(sentiments_to_insert)} sentiment records to Supabase.")
-                except Exception as e:
-                    logger.error(f"❌ Error saving to Supabase sentiment tables: {e}", exc_info=True)
+                if sentiments_to_insert:
+                    try:
+                        insert_sentiment_reports(supabase, sentiments_to_insert)
+                        logger.info(f"-> Saved {len(sentiments_to_insert)} sentiment records to Supabase.")
+                    except Exception as e:
+                        logger.error(f"❌ Error saving to Supabase sentiment tables: {e}", exc_info=True)
     
         is_last = j == (len(checkpoints) - 1)
         if not is_last:

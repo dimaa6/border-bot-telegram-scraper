@@ -138,6 +138,8 @@ explicitly describes multiple genuinely distinct segments (see additive checkpoi
 === CROSSING TIME EXTRACTION ===
 Extract `reported_crossing_minutes` only for a FULLY completed crossing, stated as a total duration (e.g. "проїхали за 2 год" -> 120, "перетнули за 10 хвилин" -> 10). 
 Do NOT extract: partial segments (e.g. time from arrival to entering the territory), ongoing/not-yet-finished waits ("вже стоїмо 1.5 год"), or general/typical-duration questions unrelated to right-now conditions ("скільки зазвичай займає перетин").
+Ignore time reported to cross only one side of the checkpoint: "До Польщі - приїхали о 11:30, український кордон пройшли за 2 години, черга на польський рухається дуже повільно" - this means person crossed only half of the checkpoint, ignore this
+time report. Only when a person says that both sides have been crossed ("пройшли обидва кордони", "пройшли два кордони", "пройшли український і польський кордон"), treat this as complete crossing time and extract it.
 
 === MOVEMENT STATE SIGNALS ===
 Throughput/rate descriptions — whether phrased as an explicit rate ("10 машин в годину", "запуск раз в годину по 10-15") or as an example ("5 хвилин тому впустили 6", "з тих пір заїхали 15-17") — inform `movement_state` only; never extract these as a queue count or crossing time.
@@ -193,7 +195,9 @@ Correct extraction for the passenger-vehicle report: value=null, landmark_mentio
 INCORRECT: landmark_mentioned="roundabout" — this wrongly borrows the bus's landmark for the car queue.
 """
 
-LOCATION_SEGMENTS = """=== LOCATION SEGMENTS for this checkpoint (recognize these and close variants/misspellings) ===
+LOCATION_SEGMENTS = """=== LOCATION SEGMENTS AND LANDMARK HANDLING (direction-specific for this checkpoint) ===
+FROM_UKRAINE (outbound) is ADDITIVE — this direction stages cars across multiple distinct pre-barrier points to avoid clutter at the barrier itself. Recognize these
+segments for FROM_UKRAINE only (recognize these and close variants/misspellings):
 - "staging" — matches: блокпост, блок пост, блок-пост, на блокпосту, на посту, в полі, на полі, поле
 - "barrier" — matches: шлагбаум, перед шлагбаумом, до шлагбауму, світлофор, перед світлофором, до світлофора
 
@@ -203,6 +207,14 @@ is safer treated as unknown than as a new, unrecognized bucket.
 
 If ONE message reports counts at multiple distinct pre-barrier locations (e.g. 'в полі' and 'перед шлагбаумом'), extract EACH as a SEPARATE entry in the list
 (same source_message_id for both) — these are components of one physical queue, not competing estimates.
+
+TO_UKRAINE (inbound) is CONTINUOUS — this direction has a single, unstaged queue. Do NOT apply `location_segment` to any to_ukraine message; leave it null always.
+For to_ukraine, a count anchored to ANY named reference point (a landmark, junction, store, or other physical marker not explicitly configured below) should be treated as
+INCOMPLETE and MUST be ignored. Only a bare, unanchored count (no reference point mentioned) should be treated as a complete to_ukraine observation.
+
+For to_ukraine, treat landmark-anchoring as a property of the INDIVIDUAL message only — do not inherit "anchored to a landmark" from an earlier message in the same reply
+chain or thread. Only ignore a count if the SAME message stating that count also names a reference point. A reply giving a number in response to "roughly how many
+cars?" is a fresh, standalone estimate and should be extracted normally, even if an earlier message in the same thread mentioned a landmark.
 """
 
 def build_prompt(
