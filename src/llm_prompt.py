@@ -185,6 +185,9 @@ Before extracting a landmark or count, first identify which clause of the messag
 
 - If a message says the passenger-vehicle queue reaches one of these landmarks and gives NO explicit car count, populate `landmark_mentioned` with the normalized label shown above and leave `value` null.
 - If a message gives an explicit count AND references a landmark from the list, extract BOTH: the explicit count into `value`, and the landmark into `landmark_mentioned`. Do not discard the landmark just because a count is present — downstream logic uses both together.- If a landmark is mentioned that is not in this list, leave `landmark_mentioned` null.
+Do not inherit "anchored to a landmark" from an earlier message in the same reply chain or thread. Only tag `landmark_mentioned` if the message CONTAINING the count
+also itself names that landmark. A reply giving a bare number in response to "how many cars roughly?" is a fresh, standalone answer and should NOT carry forward a
+landmark mentioned only in an earlier message.
 - If the ONLY landmark reference in the message is attached to an excluded vehicle type (coach bus, truck, pedestrian), leave BOTH `value` and `landmark_mentioned` null for the passenger-vehicle report — do not reuse it.
 
 Worked example (landmark misattribution to avoid):
@@ -198,7 +201,7 @@ INCORRECT: landmark_mentioned="roundabout" — this wrongly borrows the bus's la
 LOCATION_SEGMENTS = """=== LOCATION SEGMENTS AND LANDMARK HANDLING (direction-specific for this checkpoint) ===
 FROM_UKRAINE (outbound) is ADDITIVE — this direction stages cars across multiple distinct pre-barrier points to avoid clutter at the barrier itself. Recognize these
 segments for FROM_UKRAINE only (recognize these and close variants/misspellings):
-- "staging" — matches: блокпост, блок пост, блок-пост, на блокпосту, на посту, в полі, на полі, поле
+- "staging" — matches: блокпост, блок пост, блок-пост, на блокпосту, на посту, в полі, на полі, поле, в лісі, ліс
 - "barrier" — matches: шлагбаум, перед шлагбаумом, до шлагбауму, світлофор, перед світлофором, до світлофора
 
 If a message specifies which segment a count describes, populate `location_segment` with the NORMALIZED label shown above (e.g. "staging", not the raw text from the
