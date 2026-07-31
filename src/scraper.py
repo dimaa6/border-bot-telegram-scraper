@@ -118,6 +118,10 @@ async def scrape_active_channels():
         handle = cp['telegram_handle']
         min_id = cp['last_message_id']
 
+        if not handle:
+            logger.info(f"Skipping Telegram scraping for {cp_id} (no telegram_handle configured).")
+            continue
+
         logger.info(f"Checking {cp_id} (@{handle}) since message ID: {min_id}...")
 
         new_high_water_mark = min_id

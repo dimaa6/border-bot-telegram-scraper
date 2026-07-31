@@ -113,8 +113,11 @@ def parse_latest_messages(checkpoint: dict[str, Any], llm_provider: str, ai_clie
         raw_transcript, msg_map, rows_count, latest_msg_dt = get_chat_transcript(checkpoint_id, db_path, checkpoint["lookback_hours"])
 
     if raw_transcript is None:
-        logger.info(f"No messages cached for checkpoint {checkpoint_id}.")
-        return None, None, None, None
+        logger.info(f"No messages cached for checkpoint {checkpoint_id}. Falling back to Nakordoni data / basic math calculation.")
+        return BorderSentimentExtraction(
+            from_ukraine=DirectionalSentiment(movement_state="normal"),
+            to_ukraine=DirectionalSentiment(movement_state="normal")
+        ), "MATH", {}, None
 
     prompt = f"CHAT TRANSCRIPT LOGS:\n{raw_transcript}"
 
@@ -153,7 +156,7 @@ def parse_latest_messages(checkpoint: dict[str, Any], llm_provider: str, ai_clie
                     {"role": "user", "content": prompt}
                 ]
                 response = openai_client.beta.chat.completions.parse(
-                    model='gpt-5.4-mini',
+                    model='gpt-5.6-luna',
                     messages=messages,
                     response_format=BorderSentimentExtraction,
                     # temperature=0.0,
@@ -285,7 +288,7 @@ def _build_metadata(nakordoni_cp: NakordoniCheckpoint | None, is_jammed: bool, i
     Captures:
     - nakordoni: the raw sensor snapshot the LLM received as input (audit trail)
     - llm: the status flags the LLM derived (is_jammed, is_warning)
-    - prediction_source: the source of the prediction (e.g. 'LLM' or 'MATH')
+    - prediction_source: the source of the prediction (e.g. 'LLM', 'NAKORDONI', or 'MATH')
     """
     nakordoni_snapshot = {}
     if nakordoni_cp and nakordoni_cp.queue is not None:
@@ -307,7 +310,7 @@ def _build_metadata(nakordoni_cp: NakordoniCheckpoint | None, is_jammed: bool, i
     }
     if llm_data:
         llm_snapshot["state"] = llm_data.movement_state or "unknown"
-        llm_snapshot["queue"] = extracted_queue_size if extracted_queue_size is not None else "unknown"
+        llm_snapshot["queue"] = extracted_queue_size
 
     return {
         "nakordoni": nakordoni_snapshot,
@@ -551,8 +554,16 @@ def process_all_checkpoints():
                                 queue_size += landmark_queue_val
                                 logger.info(f"Added landmark '{normalized_landmark}' ({landmark_queue_val}) to explicit queue size. New total: {queue_size} for {direction_name}.")
 
+                llm_queue_size = queue_size
+                direction_prediction_source = prediction_source
+
                 if queue_size is None:
-                    queue_size = nakordoni_data.queue if nakordoni_data and nakordoni_data.queue is not None else 0
+                    if nakordoni_data and nakordoni_data.queue is not None:
+                        queue_size = nakordoni_data.queue
+                        direction_prediction_source = "NAKORDONI"
+                    else:
+                        queue_size = 0
+                        direction_prediction_source = "MATH"
 
                 # if queue_size == 0:
                 #     history = get_queue_history(supabase, checkpoint_id, direction_name, limit=4)
@@ -580,7 +591,7 @@ def process_all_checkpoints():
     
                 time_val = latest_time_report.value if latest_time_report else None
                 time_src = latest_time_report.source_message_id if latest_time_report else None
-                queue_val = queue_size if queue_size is not None else (latest_queue_report.value if latest_queue_report else None)
+                queue_val = llm_queue_size if llm_queue_size is not None else (latest_queue_report.value if latest_queue_report else None)
                 queue_src = latest_queue_report.source_message_id if latest_queue_report else None
 
                 logger.info(log_header)
@@ -632,9 +643,9 @@ def process_all_checkpoints():
                         nakordoni_data,
                         is_jammed,
                         is_warning,
-                        prediction_source,
+                        direction_prediction_source,
                         sentiment_data,
-                        queue_size
+                        llm_queue_size
                     ),
                 }
     
