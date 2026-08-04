@@ -71,7 +71,7 @@ def detect_direction(text: str) -> str | None:
     return None
 
 
-def calculate_final_wait_time(base_throughput, capacity, queue_size, sentiment, floor_limit):
+def calculate_final_wait_time(base_throughput, capacity, queue_size, sentiment, floor_limit, delay=0):
     # 1. Calculate the standard baseline minutes
     if base_throughput <= 0:
         base_throughput = 15  # Fallback to avoid division by zero
@@ -91,6 +91,10 @@ def calculate_final_wait_time(base_throughput, capacity, queue_size, sentiment, 
         
     elif sentiment.movement_state == "accelerated":
         final_minutes = int(final_minutes * 0.75)
+
+    # Add unconditional delay (e.g. ferry embark/cross/disembark overhead) if specified
+    if delay:
+        final_minutes += delay
 
     # 3. Handle crossing overrides if available
     if sentiment.reported_crossing_minutes:
@@ -405,6 +409,8 @@ def process_all_checkpoints():
             inbound_throughput = 30
             outbound_throughput = 15
             territory_capacity = 0
+            inbound_delay = 0
+            outbound_delay = 0
     
             if config_matrix.ai_heuristics:
                 if config_matrix.ai_heuristics.inbound_throughput:
@@ -413,6 +419,10 @@ def process_all_checkpoints():
                     outbound_throughput = config_matrix.ai_heuristics.outbound_throughput
                 if config_matrix.ai_heuristics.territory_capacity is not None:
                     territory_capacity = config_matrix.ai_heuristics.territory_capacity
+                if config_matrix.ai_heuristics.inbound_delay is not None:
+                    inbound_delay = config_matrix.ai_heuristics.inbound_delay
+                if config_matrix.ai_heuristics.outbound_delay is not None:
+                    outbound_delay = config_matrix.ai_heuristics.outbound_delay
     
             prefix = checkpoint_id.split('_')[0] if '_' in checkpoint_id else ""
             country_name = {
@@ -447,7 +457,8 @@ def process_all_checkpoints():
                 msg_map,
                 latest_msg_dt,
                 landmark_rules,
-                segment_mode
+                segment_mode,
+                delay=0
             ):
                 if not sentiment_data:
                     return None
@@ -580,7 +591,8 @@ def process_all_checkpoints():
                     capacity=territory_capacity,
                     queue_size=queue_size,
                     sentiment=sentiment_data,
-                    floor_limit=floor_limit
+                    floor_limit=floor_limit,
+                    delay=delay
                 )
     
                 time_str = format_wait_time(duration)
@@ -600,6 +612,8 @@ def process_all_checkpoints():
                 logger.info(f"Extracted Time:    {time_val}, source message: {time_src}")
                 logger.info(f"Extracted Queue:   {queue_val}, source message: {queue_src}")
                 logger.info(f"Calculated Delay:  {duration} min")
+                if delay:
+                    logger.info(f"Unconditional Delay: {delay} min")
                 logger.info(f"Throughput:        {throughput}")
                 logger.info(f"Capacity:          {territory_capacity}")
                 logger.info(f"Insight:           {comment}")
@@ -689,7 +703,8 @@ def process_all_checkpoints():
                 msg_map=msg_map,
                 latest_msg_dt=latest_msg_dt,
                 landmark_rules=config_matrix.ai_heuristics.landmark_rules if config_matrix.ai_heuristics else None,
-                segment_mode=config_matrix.ai_heuristics.segment_mode if config_matrix.ai_heuristics else None
+                segment_mode=config_matrix.ai_heuristics.segment_mode if config_matrix.ai_heuristics else None,
+                delay=outbound_delay
             )
             if outbound_result:
                 stats_to_insert.append(outbound_result[0])
@@ -710,7 +725,8 @@ def process_all_checkpoints():
                 msg_map=msg_map,
                 latest_msg_dt=latest_msg_dt,
                 landmark_rules=config_matrix.ai_heuristics.landmark_rules if config_matrix.ai_heuristics else None,
-                segment_mode=config_matrix.ai_heuristics.segment_mode if config_matrix.ai_heuristics else None
+                segment_mode=config_matrix.ai_heuristics.segment_mode if config_matrix.ai_heuristics else None,
+                delay=inbound_delay
             )
             if inbound_result:
                 stats_to_insert.append(inbound_result[0])
