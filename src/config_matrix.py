@@ -18,6 +18,8 @@ class AIHeuristics(BaseModel):
     landmark_rules: LandmarkRules | None = None
     landmark_mapping: dict[str, list[str]] | None = None
     segment_mode: str | None = None
+    inbound_delay: int | None = None
+    outbound_delay: int | None = None
 
 class ConfigMatrix(BaseModel):
     nakordoni: NakordoniMapping | None = None
