@@ -500,15 +500,28 @@ def process_all_checkpoints():
                         
                         queue_size = latest_queue_report.value if latest_queue_report else None
                     else:
+                        value_reports = [r for r in valid_queue_reports if r.value is not None]
+                        explicit_segment_reports = [r for r in value_reports if r.location_segment]
+
+                        def resolve_segment(r):
+                            if r.location_segment:
+                                return r.location_segment.lower()
+                            if explicit_segment_reports:
+                                nearest = min(
+                                    explicit_segment_reports,
+                                    key=lambda x: abs(x.source_message_id - r.source_message_id)
+                                )
+                                return nearest.location_segment.lower()
+                            return "barrier"
+
                         barrier_reports = []
                         staging_reports = []
-                        for r in valid_queue_reports:
-                            if r.value is not None:
-                                segment = (r.location_segment or "barrier").lower()
-                                if segment == "staging":
-                                    staging_reports.append(r)
-                                else:
-                                    barrier_reports.append(r)
+                        for r in value_reports:
+                            segment = resolve_segment(r)
+                            if segment == "staging":
+                                staging_reports.append(r)
+                            else:
+                                barrier_reports.append(r)
                         
                         latest_barrier = max(barrier_reports, key=lambda x: x.source_message_id) if barrier_reports else None
                         latest_staging = max(staging_reports, key=lambda x: x.source_message_id) if staging_reports else None
