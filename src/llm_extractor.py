@@ -12,7 +12,7 @@ from typing import Literal, Any
 from log_setup import configure_logging
 from config_matrix import ConfigMatrix
 from supabase_client import get_supabase_client, get_active_checkpoints, insert_time_stats, get_queue_history, insert_sentiment_reports
-from nakordoni_client import fetch_nakordoni_data, NakordoniCheckpoint
+from nakordoni_client import NakordoniClient, NakordoniCheckpoint, COUNTRY_BORDER_IDS
 from filter import extrapolate_trend_proxy
 from transcript_builder import get_chat_transcript, cleanup_old_messages, parse_test_transcript
 from llm_prompt import build_prompt, QueueReport, TimeReport, DirectionalSentiment, BorderSentimentExtraction
@@ -378,9 +378,7 @@ def process_all_checkpoints():
             return
         logger.info(f"TEST MODE: Using transcript from {test_transcript_path} for checkpoint {target_checkpoint_id}")
 
-    logger.info("Fetching official queue data from Nakordoni for all checkpoints...")
-    nakordoni_all_data = fetch_nakordoni_data(supabase)
-    logger.info(f"Fetched data for {len(nakordoni_all_data)} checkpoints from Nakordoni.")
+    nakordoni_client = NakordoniClient()
 
     for j, cp in enumerate(checkpoints):
         checkpoint_id = cp["checkpoint_id"]
@@ -393,10 +391,16 @@ def process_all_checkpoints():
             "OUTBOUND": None
         }
         if config_matrix.nakordoni and config_matrix.nakordoni.car:
-            if config_matrix.nakordoni.car.inbound_id:
-                matched_nakordoni["INBOUND"] = nakordoni_all_data.get(config_matrix.nakordoni.car.inbound_id)
-            if config_matrix.nakordoni.car.outbound_id:
-                matched_nakordoni["OUTBOUND"] = nakordoni_all_data.get(config_matrix.nakordoni.car.outbound_id)
+            country_prefix = checkpoint_id.split('_')[0] if '_' in checkpoint_id else ""
+            border_id = COUNTRY_BORDER_IDS.get(country_prefix)
+            if border_id:
+                nakordoni_country_data = nakordoni_client.get_country_data(border_id)
+                if config_matrix.nakordoni.car.inbound_id:
+                    matched_nakordoni["INBOUND"] = nakordoni_country_data.get(config_matrix.nakordoni.car.inbound_id)
+                if config_matrix.nakordoni.car.outbound_id:
+                    matched_nakordoni["OUTBOUND"] = nakordoni_country_data.get(config_matrix.nakordoni.car.outbound_id)
+            else:
+                logger.error(f"No known Nakordoni border id for country prefix '{country_prefix}' (checkpoint {checkpoint_id}).")
 
         logger.info(f"Processing checkpoint: {checkpoint_id}")
         metrics, prediction_source, msg_map, latest_msg_dt = parse_latest_messages(

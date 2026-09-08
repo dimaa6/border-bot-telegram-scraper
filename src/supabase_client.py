@@ -23,20 +23,6 @@ def get_active_checkpoints(supabase: Client):
         .execute()
     return response.data
 
-def get_active_country_prefixes(supabase: Client) -> set[str]:
-    """Return the set of two-letter country prefixes (e.g. 'PL', 'HU') derived from
-    the checkpoint_id of every active, non-closed checkpoint in Supabase config."""
-    response = supabase.table("checkpoint_scraper_config") \
-        .select("checkpoint_id") \
-        .eq("active", True) \
-        .eq("is_closed", False) \
-        .execute()
-    return {
-        row["checkpoint_id"].split('_')[0]
-        for row in response.data
-        if row.get("checkpoint_id") and '_' in row["checkpoint_id"]
-    }
-
 def update_supabase_state(supabase: Client, cp_id: str, new_high_water_mark: int):
     """Update the Supabase state tracker with the new high-water mark."""
     supabase.table("checkpoint_scraper_config") \

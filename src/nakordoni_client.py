@@ -1,18 +1,18 @@
 import os
 import json
 import logging
+import time
 import urllib.request
 import urllib.error
 from typing import Optional, List, Dict
 from pydantic import BaseModel, Field
-from supabase import Client
 from config_matrix import ConfigMatrix
-from supabase_client import get_active_country_prefixes
 
 logger = logging.getLogger("nakordoni_client")
 
 UKRAINE_BORDER_ID = 1
 CAR_CROSSING_TYPE = 4
+INTER_CALL_DELAY_SECONDS = 10
 
 # Two-letter checkpoint_id prefix -> Nakordoni border id, per Nakordoni's v4 migration notice.
 COUNTRY_BORDER_IDS = {
@@ -84,35 +84,36 @@ def _fetch_border_checkpoints(origin: int, destination: int, api_key: str) -> Li
         logger.error(f"Unexpected error parsing Nakordoni data for border/{origin}/{destination}/{CAR_CROSSING_TYPE}: {e}")
         return []
 
-def fetch_nakordoni_data(supabase: Client) -> Dict[str, NakordoniCheckpoint]:
+class NakordoniClient:
     """
-    Pulls border queue data from Nakordoni API (v4) using the NAKORDONI_API_KEY env var.
+    Lazily pulls border queue data from Nakordoni API (v4) using the NAKORDONI_API_KEY env var.
 
-    v4 dropped the destination=all wildcard and is no longer bidirectional, so this issues
-    one outbound (Ukraine -> country) and one inbound (country -> Ukraine) call per neighbouring
-    country derived from the active, non-closed checkpoints in Supabase config, then merges
-    every checkpoint returned into a single dictionary keyed by ppid.
+    v4 dropped the destination=all wildcard and is no longer bidirectional, so a full outbound
+    (Ukraine -> country) plus inbound (country -> Ukraine) pair of calls is only made the first
+    time a checkpoint for that country is encountered; the merged result is cached per border id
+    for the rest of the run so later checkpoints of the same country reuse it. A short delay is
+    kept between the outbound and inbound calls of a pair to stay clear of Nakordoni's rate limit.
     """
-    api_key = os.getenv("NAKORDONI_API_KEY")
-    if not api_key:
-        logger.error("Failed to load Nakordoni API key: NAKORDONI_API_KEY is not set in the .env file.")
-        return {}
 
-    prefixes = get_active_country_prefixes(supabase)
-    border_ids = {COUNTRY_BORDER_IDS[prefix] for prefix in prefixes if prefix in COUNTRY_BORDER_IDS}
+    def __init__(self):
+        self._cache: Dict[int, Dict[str, NakordoniCheckpoint]] = {}
 
-    if not border_ids:
-        logger.error("No known neighbouring countries found among active checkpoints.")
-        return {}
+    def get_country_data(self, border_id: int) -> Dict[str, NakordoniCheckpoint]:
+        if border_id in self._cache:
+            return self._cache[border_id]
 
-    result: Dict[str, NakordoniCheckpoint] = {}
-    for border_id in sorted(border_ids):
+        api_key = os.getenv("NAKORDONI_API_KEY")
+        if not api_key:
+            logger.error("Failed to load Nakordoni API key: NAKORDONI_API_KEY is not set in the .env file.")
+            return {}
+
         outbound_checkpoints = _fetch_border_checkpoints(UKRAINE_BORDER_ID, border_id, api_key)
+        time.sleep(INTER_CALL_DELAY_SECONDS)
         inbound_checkpoints = _fetch_border_checkpoints(border_id, UKRAINE_BORDER_ID, api_key)
-        for cp in outbound_checkpoints + inbound_checkpoints:
-            result[cp.ppid] = cp
 
-    return result
+        merged = {cp.ppid: cp for cp in outbound_checkpoints + inbound_checkpoints}
+        self._cache[border_id] = merged
+        return merged
 
 def match_checkpoint_with_nakordoni(config_matrix: ConfigMatrix, nakordoni_data: Dict[str, NakordoniCheckpoint]) -> Dict[str, Optional[NakordoniCheckpoint]]:
     """
