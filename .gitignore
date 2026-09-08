@@ -8,3 +8,4 @@ logs/
 .env
 db_scripts/*.py
 scratch/
+test_transcript.txt

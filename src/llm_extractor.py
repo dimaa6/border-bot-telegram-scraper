@@ -379,7 +379,7 @@ def process_all_checkpoints():
         logger.info(f"TEST MODE: Using transcript from {test_transcript_path} for checkpoint {target_checkpoint_id}")
 
     logger.info("Fetching official queue data from Nakordoni for all checkpoints...")
-    nakordoni_all_data = fetch_nakordoni_data()
+    nakordoni_all_data = fetch_nakordoni_data(supabase)
     logger.info(f"Fetched data for {len(nakordoni_all_data)} checkpoints from Nakordoni.")
 
     for j, cp in enumerate(checkpoints):
