@@ -7,12 +7,18 @@ import urllib.error
 from typing import Optional, List, Dict
 from pydantic import BaseModel, Field
 from config_matrix import ConfigMatrix
+from log_setup import configure_logging
 
-logger = logging.getLogger("nakordoni_client")
+# nakordoni_client is only ever invoked from llm_extractor.py's process_all_checkpoints,
+# so route its logs into the same llm_extractor.log rather than the unconfigured root logger
+# (which would silently drop INFO records and print ERROR ones unformatted to stderr).
+logger = configure_logging("llm_extractor.log", "nakordoni_client")
 
 UKRAINE_BORDER_ID = 1
 CAR_CROSSING_TYPE = 4
 INTER_CALL_DELAY_SECONDS = 10
+
+_last_call_at: Optional[float] = None
 
 # Two-letter checkpoint_id prefix -> Nakordoni border id, per Nakordoni's v4 migration notice.
 COUNTRY_BORDER_IDS = {
@@ -57,6 +63,13 @@ class NakordoniResponse(BaseModel):
 
 def _fetch_border_checkpoints(origin: int, destination: int, api_key: str) -> List[NakordoniCheckpoint]:
     """Issues a single v4 border call for one origin/destination pair and returns its checkpoints."""
+    global _last_call_at
+
+    now = time.monotonic()
+    since_last = f"{now - _last_call_at:.1f}s since previous call" if _last_call_at is not None else "first call this run"
+    logger.info(f"Calling Nakordoni border/{origin}/{destination}/{CAR_CROSSING_TYPE} ({since_last}).")
+    _last_call_at = now
+
     url = f"https://nakordoni.eu/api/v4/data/border/{origin}/{destination}/{CAR_CROSSING_TYPE}"
     req = urllib.request.Request(url, headers={
         "Authorization": f"Bearer {api_key}",
